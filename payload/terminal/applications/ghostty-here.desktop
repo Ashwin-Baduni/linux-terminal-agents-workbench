@@ -2,8 +2,8 @@
 Type=Application
 Name=Ghostty (open here)
 Comment=Used by "Open in Terminal" and Ctrl+Alt+T: opens a Ghostty window in the requested folder
-Exec=/usr/bin/ghostty +new-window
-TryExec=/usr/bin/ghostty
+Exec=@GHOSTTY_BIN@ +new-window
+TryExec=@GHOSTTY_BIN@
 Icon=com.mitchellh.ghostty
 Terminal=false
 NoDisplay=true

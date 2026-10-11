@@ -4,7 +4,7 @@
 #   requires   components installed with this one
 #   apt, snap  packages the installer adds when missing (it never upgrades);
 #              a snap is {name, classic}
-#   commands   programs the component uses but does not install
+#   cli        agent command-line tools installed with their vendors' installers when missing
 #   units      systemd user units enabled after installing
 #   gsettings  GNOME settings applied (see the file for its operations)
 
@@ -39,9 +39,29 @@ units = ["workspace-monitor.service", "workspace-save.timer"]
 gsettings = "payload/workspace/gsettings.json"
 
 [component.agents]
-summary = "Agent pairs (the relay), plus the Claude Code and Codex integration settings"
+summary = "Agent pairs (the relay), Claude Code and Codex, and their integration settings"
 requires = ["workspace"]
-commands = ["claude", "codex"]
+apt = ["curl"]  # both vendor installers download with curl
+
+# A CLI that is missing is installed with the vendor's own native installer, downloaded
+# to a file first and kept under ~/.local/state/workbench/downloads. An existing one is
+# left alone. --claude-version / --codex-version choose another release.
+[component.agents.cli.claude]
+installer = "https://claude.ai/install.sh"
+interpreter = "bash"
+args = ["{version}"]
+version = "latest"
+versions = '(stable|latest|[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)'
+docs = "https://code.claude.com/docs/en/setup"
+
+[component.agents.cli.codex]
+installer = "https://chatgpt.com/codex/install.sh"
+interpreter = "sh"
+args = ["--release", "{version}"]
+env = { CODEX_NON_INTERACTIVE = "1" }
+version = "latest"
+versions = '(latest|[0-9]+\.[0-9]+\.[0-9]+(-alpha(\.[0-9]+){0,2}|-beta(\.[0-9]+)?)?)'
+docs = "https://learn.chatgpt.com/docs/codex/cli"
 
 # Opt-in permission policies. Without one, the target's own policy stays as it is.
 [component.agents.presets]

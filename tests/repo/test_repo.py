@@ -107,7 +107,7 @@ class Staged(unittest.TestCase):
                 continue
             data = (HOME / entry.target).read_bytes()
             self.assertFalse(set(TOKEN.findall(data)) & {n.encode() for n in MANIFEST.placeholders}, entry.target)
-            if entry.render:
+            if entry.render and b'@HOME@' in (REPO / entry.source).read_bytes():
                 self.assertIn(str(HOME).encode(), data, entry.target)
             # Nothing staged may point back at the account running the tests.
             self.assertNotIn((REAL_HOME + '/').encode(), data, entry.target)
@@ -240,10 +240,6 @@ class MemoryTemplates(unittest.TestCase):
         self.assertNotIn('- [', index.split('## Index', 1)[1])
         self.assertIn('@~/ai-memory/MEMORY.md', (REPO / 'templates/memory/CLAUDE.md').read_text())
 
-    def test_codex_reads_the_same_rules(self):
-        home = scratch(self) / 'home'
-        stage(home, ['memory'])
-        self.assertEqual((home / '.codex/AGENTS.md').resolve(), (home / 'ai-memory/MEMORY.md').resolve())
 
 
 class ThirdParty(unittest.TestCase):

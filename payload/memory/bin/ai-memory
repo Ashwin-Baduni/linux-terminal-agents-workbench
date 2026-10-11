@@ -227,19 +227,22 @@ def link(args):
         die(f'{args.dir} is not a folder.')
     if HOME.is_relative_to(folder) or folder.is_relative_to(ROOT):
         die(f'{tilde(folder)} cannot have a project memory: memory saved there is global.')
-    current = marked(folder)
-    name = args.name or current or slug(folder.name)
-    if not NAME.fullmatch(name):
-        die(f'"{name}" is not a usable name: use lower-case words joined by hyphens.')
-    if current and current != name:
-        die(f'{tilde(folder)} already uses the project memory "{current}".')
-    if not current and not args.nested:
-        above, other = find(folder.parent)
-        if above:
-            die(f'{tilde(above)} already gives this folder its memory ("{other}"). Use that one, '
-                'or pass --nested for a separate memory here.')
-    # Two links at once would otherwise both read the index and the second write would drop the first.
+    if args.name and not NAME.fullmatch(args.name):
+        die(f'"{args.name}" is not a usable name: use lower-case words joined by hyphens.')
+    # Everything that reads the markers or the index happens under the lock: two links at once
+    # would otherwise both decide from the same old state, and the second would undo the first.
     with index_lock():
+        current = marked(folder)
+        name = args.name or current or slug(folder.name)
+        if not NAME.fullmatch(name):
+            die(f'"{name}" is not a usable name: use lower-case words joined by hyphens.')
+        if current and current != name:
+            die(f'{tilde(folder)} already uses the project memory "{current}".')
+        if not current and not args.nested:
+            above, other = find(folder.parent)
+            if above:
+                die(f'{tilde(above)} already gives this folder its memory ("{other}"). Use that one, '
+                    'or pass --nested for a separate memory here.')
         settings = claude_settings(folder)
         owner = listed().get(name)
         if owner and not current:

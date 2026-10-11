@@ -1,0 +1,4 @@
+# Login shells read this file; load ~/.bashrc so they get the same setup.
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+    . "$HOME/.bashrc"
+fi

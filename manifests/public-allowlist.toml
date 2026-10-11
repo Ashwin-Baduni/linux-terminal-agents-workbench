@@ -1,5 +1,6 @@
 # Reviewed exceptions for scripts/check-public.py. Each entry allows one exact value in
-# matching files. Keep upstream notices and metadata intact rather than deleting them.
+# matching files, and only on lines containing `context` when it is given. Keep upstream
+# notices and metadata intact rather than deleting them.
 
 [[allow]]
 path = "vendor/bash-preexec/bash-preexec.sh"
@@ -15,3 +16,36 @@ reason = "Catppuccin Mocha theme identifier from the upstream theme"
 path = "vendor/yazi-plugins/git.yazi/README.md"
 value = "34976be9-a871-4ffe-9d5a-c4cdd0bf4576"
 reason = "upstream screenshot link in the Yazi git plugin README"
+
+[[allow]]
+path = "tests/installer/test_installer.py"
+value = "ubuntu-dock@ubuntu.com"
+reason = "a GNOME extension identifier (Ubuntu's dock), not an email address"
+
+[[allow]]
+path = "tests/repo/test_publication.py"
+value = "someone.private@gmail.com"
+reason = "made-up personal address the scan must catch"
+
+[[allow]]
+path = "tests/repo/test_publication.py"
+value = "person@private-mail.org"
+reason = "made-up personal address the scan must catch"
+
+[[allow]]
+path = "*.md"
+value = "Ashwin-Baduni"
+context = "github.com/Ashwin-Baduni/linux-terminal-agents-workbench"
+reason = "the public repository's own clone URL"
+
+[[allow]]
+path = "*.md"
+value = "Ashwin"
+context = "github.com/Ashwin-Baduni/linux-terminal-agents-workbench"
+reason = "the public repository's own clone URL"
+
+[[allow]]
+path = "*.md"
+value = "Baduni"
+context = "github.com/Ashwin-Baduni/linux-terminal-agents-workbench"
+reason = "the public repository's own clone URL"

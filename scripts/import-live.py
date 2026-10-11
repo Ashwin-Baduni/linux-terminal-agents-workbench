@@ -13,14 +13,21 @@ apply. Nothing outside the manifest is ever read.
 Files changed in the repository on purpose (fixes, neutral names) show up as
 differences until the live machine is reinstalled from the repository. Review
 every difference; never write blindly.
+
+Before anything is written, each proposed file goes through the publication scan
+(scripts/public_scan.py: secrets, this machine's names, emails, UUIDs, home folders,
+plus --patterns FILE for other private names). A file with findings is not written.
 """
 import argparse
 import difflib
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
 from installer.manifest import load  # noqa: E402
+import public_scan  # noqa: E402
 
 
 def sanitized(entry, home):
@@ -39,12 +46,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--home', type=Path, default=Path.home(), help='the home to read (default: yours)')
     parser.add_argument('--diff', action='store_true')
+    parser.add_argument('--patterns', type=Path, action='append', default=[],
+                        help='a file of private patterns (one regular expression per line) to refuse')
+    parser.add_argument('--repo', type=Path, default=HERE.parent, help=argparse.SUPPRESS)
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--write', nargs='+', metavar='PATH', default=[])
     group.add_argument('--write-all', action='store_true')
     args = parser.parse_args()
-    manifest = load()
+    manifest = load(args.repo.resolve())
     home = args.home.resolve()
+    found_patterns = public_scan.patterns(args.patterns)
+    allowlist = public_scan.load_allowlist(manifest.repo)
+    if (args.write or args.write_all) and not args.patterns:
+        print('note: no --patterns file given; only secrets and this machine\'s own names are checked.')
     sources = {}
     for entry in manifest.entries:
         if entry.source and entry.live:
@@ -79,6 +93,13 @@ def main():
             sys.stdout.writelines(difflib.unified_diff(old.splitlines(True), text.splitlines(True),
                                                        'repository/' + source, 'live/' + entry.live))
         if args.write_all or source in args.write:
+            findings = public_scan.scan_text(source, source, text, found_patterns, allowlist)
+            if findings:
+                problems += 1
+                print('  not written: the publication scan found')
+                for finding in findings:
+                    print('    ' + finding)
+                continue
             current.parent.mkdir(parents=True, exist_ok=True)
             current.write_text(text)
             print(f'  written from ~/{entry.live}')

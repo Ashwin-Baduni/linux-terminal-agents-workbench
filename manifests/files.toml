@@ -10,7 +10,8 @@
 # Kinds (default "file"):
 #   file    install the source at target, backing up whatever was there
 #   seed    install only when target does not exist yet; never overwrite
-#   link    create a symlink at target pointing to `link` (always relative)
+#   link    create a symlink at target pointing to `link` (always relative); an
+#           existing file or different link there is backed up and replaced
 #   dir     create the directory target
 #   merge   combine source into an existing target with `strategy`, keeping
 #           everything else in that file (implemented by the installer)
@@ -19,6 +20,7 @@
 #   component  which component installs it (see components.toml)
 #   mode       octal permission bits; default 644
 #   render     replace @PLACEHOLDER@ tokens (see [placeholders]) at install time
+#   skip_if    (seeds) other home paths whose presence also means "already there"
 #   sanitize   [[old, new], ...] replacements import-live applies after turning the
 #              live home path into @HOME@. Never list private names here: this file
 #              is public. Files the repository changed on purpose simply show up as
@@ -32,6 +34,7 @@ format = 1
 [placeholders]
 HOME = "absolute path of the target home"
 CLAUDE_BIN = "the target user's claude executable"
+GHOSTTY_BIN = "the ghostty executable"
 
 # --- terminal ----------------------------------------------------------------
 
@@ -56,6 +59,15 @@ kind = "merge"
 strategy = "bash-block"
 source = "payload/terminal/shell/bashrc.sh"
 target = ".bashrc"
+live = false
+
+# Only when there is no login profile at all, so login shells also read ~/.bashrc.
+[[file]]
+component = "terminal"
+kind = "seed"
+source = "payload/terminal/shell/profile"
+target = ".profile"
+skip_if = [".bash_profile", ".bash_login"]
 live = false
 
 [[file]]
@@ -135,6 +147,8 @@ mode = "755"
 component = "terminal"
 source = "payload/terminal/applications/ghostty-here.desktop"
 target = ".local/share/applications/ghostty-here.desktop"
+render = true
+sanitize = [["/usr/bin/ghostty", "@GHOSTTY_BIN@"]]
 
 [[file]]
 component = "terminal"
@@ -385,12 +399,16 @@ source = "templates/memory/CLAUDE.md"
 target = ".claude/CLAUDE.md"
 live = false
 
-# Codex reads the same rules through its global AGENTS.md.
+# Codex reads the same rules through its global AGENTS.md: a symlink to the memory when
+# there is none yet, otherwise a reference block added to the existing instructions (and
+# to AGENTS.override.md, which Codex reads instead when it exists).
 [[file]]
 component = "memory"
-kind = "link"
+kind = "merge"
+strategy = "codex-instructions"
+source = "templates/memory/AGENTS-reference.md"
 target = ".codex/AGENTS.md"
-link = "../ai-memory/MEMORY.md"
+live = false
 
 [[file]]
 component = "memory"

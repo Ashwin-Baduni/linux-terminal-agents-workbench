@@ -2,15 +2,16 @@
 
 Staging writes files, seeds, links and folders only. It never merges into existing
 settings, runs package managers, or touches the desktop, services or the real home;
-the tests run against a staged home, and the installer builds on the same plan.
+the tests run against a staged home. Writes go through fsops.Home, so a symlinked
+folder can never lead them outside the staged home.
 """
 import json
 import os
 from pathlib import Path
 import pwd
 import re
-import tempfile
 
+from .fsops import Home
 from .manifest import load
 
 MARKER = '.workbench-stage.json'
@@ -21,16 +22,7 @@ SAFE_HOME = re.compile(r'/[A-Za-z0-9_./-]+')
 def values_for(home):
     """Placeholder values for a target home, never taken from the machine running the stage."""
     home = Path(home)
-    return {'HOME': str(home), 'CLAUDE_BIN': str(home / '.local/bin/claude')}
-
-
-def write(path, data, mode):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name + '.')
-    with os.fdopen(handle, 'wb') as stream:
-        stream.write(data)
-    os.chmod(temporary, mode)
-    os.replace(temporary, path)
+    return {'HOME': str(home), 'CLAUDE_BIN': str(home / '.local/bin/claude'), 'GHOSTTY_BIN': '/usr/bin/ghostty'}
 
 
 def stage(home, components=None, manifest=None, values=None):
@@ -42,24 +34,25 @@ def stage(home, components=None, manifest=None, values=None):
     real = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     if real.is_relative_to(home):
         raise ValueError('Staging writes into a scratch home, never the real one.')
+    home.mkdir(parents=True, exist_ok=True)
+    target = Home(home)
     values = values or values_for(home)
     written = []
     for entry in manifest.select(components):
-        path = home / entry.target
         if entry.kind == 'merge':
             continue
+        state = target.state(entry.target)
         if entry.kind == 'dir':
-            path.mkdir(parents=True, exist_ok=True)
+            target.mkdir(entry.target)
         elif entry.kind == 'link':
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if path.is_symlink() or path.exists():
-                path.unlink()
-            path.symlink_to(entry.link)
-        elif entry.kind == 'seed' and (path.exists() or path.is_symlink()):
+            target.symlink(entry.target, entry.link)
+        elif entry.kind == 'seed' and (state.kind != 'absent' or
+                                       any(target.state(p).kind != 'absent' for p in entry.skip_if)):
             continue
         else:
-            write(path, manifest.render(entry, values), entry.mode)
+            target.write(entry.target, manifest.render(entry, values), entry.mode)
         written.append(entry.target)
     chosen = manifest.closure(components or manifest.default)
-    (home / MARKER).write_text(json.dumps({'repository': str(manifest.repo), 'components': chosen}, indent=2) + '\n')
+    target.write(MARKER, (json.dumps({'repository': str(manifest.repo), 'components': chosen}, indent=2) + '\n').encode(),
+                 0o644)
     return written

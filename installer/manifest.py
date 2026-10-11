@@ -8,7 +8,7 @@ import tomllib
 REPO = Path(__file__).resolve().parent.parent
 KINDS = ('file', 'seed', 'link', 'dir', 'merge')
 STRATEGIES = ('bash-block', 'inputrc', 'json', 'lines-first', 'mimeapps', 'claude-settings',
-              'codex-config', 'claude-import', 'git-ignore')
+              'codex-config', 'claude-import', 'git-ignore', 'codex-instructions')
 # Everything under these folders must be claimed by a manifest entry.
 SHIPPED = ('payload', 'vendor', 'templates', 'licenses')
 TOKEN = re.compile(rb'@([A-Z][A-Z0-9_]*)@')
@@ -30,6 +30,7 @@ class Entry:
     link: str | None = None
     live: str | None = None
     sanitize: tuple = ()
+    skip_if: tuple = ()
 
 
 @dataclass
@@ -103,7 +104,8 @@ def entry_from(raw, components, where):
     return Entry(component=raw['component'], kind=kind, target=target, source=source,
                  mode=int(str(raw.get('mode', '644')), 8), render=bool(raw.get('render', False)),
                  strategy=strategy, link=link, live=live or None,
-                 sanitize=tuple(tuple(pair) for pair in raw.get('sanitize', [])))
+                 sanitize=tuple(tuple(pair) for pair in raw.get('sanitize', [])),
+                 skip_if=tuple(relative(p, f'{where} skip_if') for p in raw.get('skip_if', [])))
 
 
 def expand_tree(repo, raw, components, where):

@@ -24,7 +24,8 @@ sys.path.insert(0, str(HERE))
 import support  # noqa: E402
 
 SUITES = {
-    'repo': ['repo/test_repo.py'],
+    'repo': ['repo/test_repo.py', 'repo/test_publication.py'],
+    'installer': ['installer/test_installer.py'],
     'memory': ['memory/test_ai_memory.py'],
     'copy': ['workspace/test_copy_everything.py'],
     'workspace': ['workspace/check_workspace.py'],

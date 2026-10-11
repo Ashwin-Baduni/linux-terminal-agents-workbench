@@ -368,9 +368,11 @@ class Concurrency(Base):
         return any('->' in fields and str(pid) in fields
                    for fields in map(str.split, Path('/proc/locks').read_text().splitlines()))
 
-    def test_link_waits_while_another_updates_the_index(self):
-        """A second link that starts while the first has read the index but not yet written it."""
-        first, second = self.folder('first'), self.folder('second')
+    def race(self, first_args, second_args, second_cwd, pause_before='MEMORY.md'):
+        """Run a link in this process and pause it just before it writes the file named pause_before
+        (by default the global index, after the link has read it). A second link starts in that pause
+        and runs until it finishes (the old race) or queues behind the first. Returns the second
+        run's (returncode, stdout, stderr)."""
         loader = importlib.machinery.SourceFileLoader('ai_memory_under_test', str(SCRIPT))
         other = []
         with mock.patch.dict(os.environ, self.env, clear=True):
@@ -379,10 +381,8 @@ class Concurrency(Base):
             write = tool.write
 
             def paused_write(path, text):
-                if path == tool.INDEX and not other:
-                    # The first link holds its view of the index. Start the second link now and let it
-                    # run until it either finishes (the old race) or queues behind the first.
-                    other.append(subprocess.Popen([str(SCRIPT), 'link'], cwd=second, env=self.env,
+                if Path(path).name == pause_before and not other:
+                    other.append(subprocess.Popen([str(SCRIPT), *second_args], cwd=second_cwd, env=self.env,
                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
                     deadline = time.monotonic() + 30
                     while other[0].poll() is None and not self.waiting_for_lock(other[0].pid):
@@ -391,14 +391,32 @@ class Concurrency(Base):
                 write(path, text)
 
             tool.write = paused_write
-            with mock.patch.object(sys, 'argv', ['ai-memory', 'link', '--dir', str(first)]), \
+            with mock.patch.object(sys, 'argv', ['ai-memory', *first_args]), \
                     contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as finished:
                 tool.main()
         self.assertEqual(finished.exception.code, 0)
         out, err = other[0].communicate(timeout=30)
-        self.assertEqual(other[0].returncode, 0, out + err)
+        return other[0].returncode, out, err
+
+    def test_link_waits_while_another_updates_the_index(self):
+        """Two folders linked at once both stay listed."""
+        first, second = self.folder('first'), self.folder('second')
+        code, out, err = self.race(['link', '--dir', str(first)], ['link'], second)
+        self.assertEqual(code, 0, out + err)
         self.assertEqual(self.names(), ['first', 'second'])
         self.assertIn('ok', self.run_tool('status').stdout)
+
+    def test_same_folder_linked_twice_at_once(self):
+        """The second link of one folder sees the first one's marker, so the folder keeps one memory."""
+        folder = self.folder('shared')
+        # Pause the first link after it checked the folder but before it writes the folder's marker.
+        code, out, err = self.race(['link', 'one', '--dir', str(folder)], ['link', 'two'], folder,
+                                   pause_before='.ai-memory')
+        self.assertNotEqual(code, 0, out)
+        self.assertIn('already uses the project memory "one"', err)
+        self.assertEqual(self.names(), ['one'])
+        self.assertEqual((folder / '.ai-memory').read_text(), '~/ai-memory/projects/one\n')
+        self.assertFalse((self.memory / 'projects/two').exists())
 
     def test_many_links_at_once(self):
         folders = [self.folder(f'project-{n}') for n in range(8)]
