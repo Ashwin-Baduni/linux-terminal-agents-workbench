@@ -103,8 +103,27 @@ def json_settings(existing, wanted, what='the settings file'):
     return _dump_json(existing, before, deep_merge(before, json.loads(wanted)))
 
 
+def _matcher(group):
+    """A hook group's matcher, with the spellings that match everything made equal."""
+    value = group.get('matcher')
+    return '' if value in (None, '', '*') else value
+
+
+def _same_hook(a, b):
+    return all(a.get(key, default) == b.get(key, default)
+               for key, default in (('type', 'command'), ('command', None), ('prompt', None)))
+
+
+def _has_group(groups, wanted):
+    """True when one existing group has the same matcher and every wanted hook."""
+    return any(isinstance(group, dict) and _matcher(group) == _matcher(wanted) and
+               all(any(_same_hook(hook, have) for have in group.get('hooks', [])) for hook in wanted['hooks'])
+               for group in groups)
+
+
 def claude_settings(existing, wanted, what='~/.claude/settings.json'):
-    """Our keys are set, our hooks added once by command; other keys and hooks stay."""
+    """Our keys are set and our hook groups added unless an equivalent group exists (same event,
+    matcher, hook type and command); other keys and hooks stay."""
     before = _load_json(existing, what)
     wanted = json.loads(wanted) if isinstance(wanted, str) else wanted
     hooks = wanted.get('hooks', {})
@@ -115,9 +134,10 @@ def claude_settings(existing, wanted, what='~/.claude/settings.json'):
             raise MergeError(f'{what}: "hooks" is not an object.')
         for event, groups in hooks.items():
             previous = merged.setdefault(event, [])
+            if not isinstance(previous, list):
+                raise MergeError(f'{what}: hooks.{event} is not a list.')
             for group in groups:
-                commands = {h.get('command') for entry in previous for h in entry.get('hooks', [])}
-                if not all(h['command'] in commands for h in group['hooks']):
+                if not _has_group(previous, group):
                     previous.append(copy.deepcopy(group))
         result['hooks'] = merged
     return _dump_json(existing, before, result)

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 
@@ -33,6 +34,10 @@ class Options:
     packages: bool = False              # install missing Ubuntu packages and snaps
     agents: bool = False                # install missing agent CLIs
     desktop: bool = False               # GNOME settings, user units and caches
+
+
+def account_home():
+    return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 
 
 def resolve_values(home, real):
@@ -76,6 +81,8 @@ class Run:
         self.manifest = load()
         if not SAFE_HOME.fullmatch(str(Path(options.home).resolve())):
             raise Refused(f'{options.home}: use a home path without spaces or shell metacharacters.')
+        if not options.real and account_home().is_relative_to(Path(options.home).resolve()):
+            raise Refused(f'{options.home} is your own home or contains it; staging needs a separate folder.')
         self.home = Home(options.home)
         self.chosen = self.manifest.closure(options.components or self.manifest.default)
         self.desktop = desktop or (Desktop() if options.desktop else None)
@@ -185,11 +192,14 @@ class Run:
             if stuck:
                 raise Refused('An earlier installation did not finish. Restore it first with\n'
                               f'  ./install.sh --rollback {stuck[-1][0]}')
+            # Settle every file change first: a broken setting or an unsafe symlink stops the
+            # installation before any package or agent CLI is installed.
+            self.plan()
             apt, snaps = self.missing()
             packages.install_apt(apt, log)
             packages.install_snaps(snaps, log)
             versions = self.install_agents()
-            plan = self.plan()
+            plan = self.plan()        # again, now that the agent CLIs' paths are known
             settings, units, skipped = self.desktop_steps(plan)
             self.report_plan(plan, settings, units, skipped)
             if not (plan.changes or settings or units):
@@ -205,7 +215,7 @@ class Run:
             try:
                 transaction.apply()
             except BaseException:
-                log(f'\nThe installation failed and its changes were undone. Details: {folder}/journal.json')
+                self.report_failure(transaction.journal, folder)
                 raise
             if self.options.desktop:
                 for cache in refresh_caches(self.home.root, None, {c.path for c in plan.changes}):
@@ -213,6 +223,24 @@ class Run:
             log(f'\nInstalled. Backup and journal: {folder}')
             self.final_notes(plan, folder, versions)
             return 0
+
+    def report_failure(self, journal, folder):
+        recovery = journal.get('recovery', {})
+        log = self.log
+        if journal.get('status') == 'rolled-back':
+            log(f'\nThe installation failed ({journal.get("error")}); everything it had changed was put back.')
+            for item in recovery.get('kept', []):
+                log('  left in place: ' + item)
+        else:
+            log(f'\nThe installation failed ({journal.get("error")}) and could not undo everything.')
+            for problem in recovery.get('problems', []):
+                log('  not undone: ' + problem)
+            if recovery.get('undo_error'):
+                log('  the undo itself failed: ' + recovery['undo_error'])
+            log('Changes made by you or another program were kept. Review them, then run\n'
+                f'  ./install.sh --rollback {folder}\n'
+                'Add --keep-changed to keep those changes and restore everything else.')
+        log(f'Details: {folder}/journal.json')
 
     def install_agents(self):
         versions = {}
@@ -261,7 +289,7 @@ class Run:
                 'memory notes you have written since.')
 
 
-def rollback(options, folder, log=print, desktop=None):
+def rollback(options, folder, log=print, desktop=None, keep_changed=False):
     home = Home(options.home)
     with install_lock(home):
         target = latest(home) if folder in ('last', 'latest') else Path(folder).expanduser().absolute()
@@ -271,9 +299,9 @@ def rollback(options, folder, log=print, desktop=None):
             if not options.real:
                 raise Refused('This backup also changed GNOME settings and services; roll it back from that account.')
             desktop = Desktop()
-        problems, left = undo(home, target, desktop)
-        log(f'Rolled back {target}.')
-        for item in left:
+        outcome = undo(home, target, desktop, keep_changed=keep_changed)
+        log(f'Rolled back {target}: {len(outcome.restored)} item(s) restored.')
+        for item in outcome.left:
             log('  left in place: ' + item)
         log('Installed packages, agent CLIs, sign-ins and memory notes written since are not part of a rollback.')
         return 0

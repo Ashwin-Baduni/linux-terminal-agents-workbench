@@ -25,8 +25,9 @@ When it finishes, open a new terminal window. Log out and back in once so GNOME 
 | `--agent-policy full-access` | Also turns off the approval prompts of Claude Code and Codex (see below). |
 | `--claude-version`, `--codex-version` | The release used when that CLI is missing. The default is `latest`. Claude Code also takes `stable`, and both take an exact version such as `2.1.89`. |
 | `--no-activate` | Files only. No packages, agent CLIs, GNOME settings or services. |
-| `--target-home DIR` | Installs the files into another folder instead of your home, for trying it out. Nothing on the computer itself changes. |
+| `--target-home DIR` | Stages the files into a separate folder instead of your home, for trying it out. Nothing on the computer itself changes. Your own home, or a folder that contains it, is refused here. |
 | `--rollback BACKUP` | Restores the state before an installation. `last` means the most recent one. |
+| `--keep-changed` | With `--rollback`: keeps files, settings and services changed since the installation, and restores everything else. |
 
 ## Components
 
@@ -48,7 +49,7 @@ Nothing is overwritten without a backup. The plan names every file before anythi
 - **Plain configuration files** (themes, scripts, units) are replaced when they differ. Their permissions are kept, and scripts stay executable.
 - **`~/.bashrc`** gets one managed block. An older version of the same terminal block is replaced, once. Everything else stays.
 - **`~/.inputrc`** gets the key bindings added once.
-- **`~/.claude/settings.json`** gets the theme, voice, copy and hook settings. Your other settings and hooks stay. A new file is private (0600).
+- **`~/.claude/settings.json`** gets the theme, voice, copy and hook settings. Your other settings and hooks stay. The workspace hook is added unless a group with the same event and matcher already runs the same command. A hook limited to some tools does not count. A new file is private (0600).
 - **`~/.codex/config.toml`** gets the copy settings, changed in place. Projects, providers, MCP servers and comments stay. A new file is private.
 - **`mimeapps.list`** gets defaults only for file types that have none. Your own choices win.
 - **The git ignore list** (the one git uses, `core.excludesfile` included) gets the two memory patterns.
@@ -66,7 +67,7 @@ An agent CLI you already have is kept and never upgraded. A missing one is insta
 - **Claude Code:** [code.claude.com/docs/en/setup](https://code.claude.com/docs/en/setup), `https://claude.ai/install.sh`
 - **Codex:** [learn.chatgpt.com/docs/codex/cli](https://learn.chatgpt.com/docs/codex/cli), `https://chatgpt.com/codex/install.sh`
 
-The installer downloads each script over HTTPS into `~/.local/state/workbench/downloads/`, prints its SHA-256, runs it as you, and keeps it there for inspection with a `SHA256SUMS` file. `./install.sh --check` shows which installers would run, with which release. Both CLIs land in `~/.local/bin`. The versions found or installed are printed at the end and recorded in `~/.local/state/workbench/installed.json`. Claude Code's native install keeps itself updated, as its documentation describes.
+The installer downloads each script over HTTPS into `~/.local/state/workbench/downloads/` and prints its SHA-256. Before running a script, it checks it against the interface that was reviewed: the argument that selects the release, the non-interactive switch, the `~/.local/bin` destination, and the list of releases the script accepts. A script that has changed is not run. The installer stops and points to the vendor's own instructions. A script that passes is run as you and kept with a `SHA256SUMS` file for inspection. `./install.sh --check` shows which installers would run, with which release. Both CLIs land in `~/.local/bin`. The versions found or installed are printed at the end and recorded in `~/.local/state/workbench/installed.json`. Claude Code's native install keeps itself updated, as its documentation describes.
 
 ## Agent permissions
 
@@ -88,7 +89,13 @@ It enables and starts the selected user services: `workspace-monitor.service`, `
 
 Every installation that changes something writes a journal and a copy of each file it replaces to `~/.local/state/workbench/backups/<time>/`. This happens before the first change. The journal also records the previous GNOME values and the services' previous state.
 
-`./install.sh --rollback last` (or the folder printed at the end) first checks everything. If a file or setting changed after the installation, it lists what changed and restores nothing. A rollback also refuses a backup copy that no longer matches its checksum, and a folder that has since become a symlink leading outside your home. When nothing conflicts, it brings back the old files, symlinks, permissions, GNOME values and service states, and removes what the installation created.
+`./install.sh --rollback last` (or the folder printed at the end) first checks everything. If a file, a GNOME setting or a service's enablement changed after the installation, it lists what changed and restores nothing. Run it again with `--keep-changed` to keep those changes and restore everything else. A rollback also refuses a backup copy that no longer matches its checksum, and a folder that has since become a symlink leading outside your home.
+
+When nothing conflicts, the rollback goes in this order:
+1. It stops and disables the services the installation started or enabled, while their unit files are still in place.
+2. It brings back the old files, symlinks and permissions, and removes what the installation created.
+3. It sets the GNOME values back.
+4. It reloads systemd and restarts the services that were running before, so they run the restored files.
 
 These stay after a rollback:
 - installed Ubuntu packages and snaps
@@ -96,7 +103,9 @@ These stay after a rollback:
 - sign-ins
 - memory you wrote after installing (a new `~/ai-memory/MEMORY.md` you have added to is kept)
 
-If an installation fails, its finished steps are undone at once. If it is killed partway, the next run refuses to continue until you run `--rollback` on it. That rollback also covers the step it was on.
+If an installation fails, it undoes what it had done at once. That includes a step that failed halfway, such as a setting that was written before an error, or a service that was enabled but would not start. If something you changed during the installation is in the way, the undo keeps your change. It records the installation as failed, not rolled back, and names what it could not undo. The next run then refuses to continue until you have run `--rollback` (with `--keep-changed` if you want to keep your change).
+
+If an installation is killed partway, the next run also refuses to continue until you run `--rollback` on it. That rollback covers the step the installation was on, too.
 
 ## Trying it without touching your setup
 
@@ -112,5 +121,6 @@ This writes and merges files inside `/tmp/try-home` only. It installs no package
 
 - Only the tested Ubuntu, GNOME and Wayland versions are accepted for a real installation.
 - The home path must not contain spaces or shell characters, because it is written into desktop entries and configuration files.
+- Before installing any package or agent CLI, the installer works out every file change. A broken settings file or an unsafe symlink therefore stops it before anything else happens.
 - Fresh-desktop behaviour has to be rehearsed on a disposable Ubuntu 26.04 machine: the GNOME session, glyphs, the clipboard extension after login, and the real agent installers and sign-ins. The automated tests use stand-ins for the desktop, services and vendor installers.
 - Hide Top Bar, display tuning and other personal machine settings are not included.

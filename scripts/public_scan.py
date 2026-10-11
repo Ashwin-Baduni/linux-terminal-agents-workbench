@@ -77,6 +77,11 @@ def allowed(allowlist, name, value, line=''):
                and (name == ALLOWLIST or item.get('context', '') in line) for item in allowlist)
 
 
+def redact(value):
+    """Enough of a secret to find it again, never the secret itself."""
+    return f'{value[:4]}… ({len(value)} characters, redacted)'
+
+
 def scan_text(label, name, data, found_patterns, allowlist):
     """Findings for one text: secrets, private names, emails, UUIDs and real home folders."""
     findings = []
@@ -88,7 +93,8 @@ def scan_text(label, name, data, found_patterns, allowlist):
         for kind, pattern in found_patterns.items():
             for match in re.finditer(pattern, line):
                 if not allowed(allowlist, name, match.group(0), line):
-                    findings.append(f'{label}:{number}: {kind}: {match.group(0)[:60]}')
+                    shown = redact(match.group(0)) if kind in SECRETS else match.group(0)[:60]
+                    findings.append(f'{label}:{number}: {kind}: {shown}')
         for match in EMAIL.finditer(line):
             value = match.group(0)
             if not SAFE_EMAIL.search(value) and not allowed(allowlist, name, value, line):

@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 
 LOCAL_HOSTS = ('127.0.0.1', 'localhost')
+USER_AGENT = 'linux-terminal-agents-workbench-installer/1'
 
 
 @dataclass
@@ -61,7 +62,9 @@ def download(url, folder):
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != 'https' and not (parts.scheme == 'http' and parts.hostname in LOCAL_HOSTS):
         raise ValueError(f'Refusing to download an installer over {parts.scheme}: {url}')
-    with urllib.request.urlopen(url, timeout=60) as response:
+    # The vendors' download hosts refuse Python's default user agent (HTTP 403).
+    request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(request, timeout=60) as response:
         data = response.read()
     if not data.startswith(b'#!'):
         raise ValueError(f'{url} did not return a shell script.')
@@ -71,11 +74,49 @@ def download(url, folder):
     return path, hashlib.sha256(data).hexdigest()
 
 
+# How each vendor installer was reviewed to work (2026-10-11): the lines it must still contain
+# for the arguments below to mean what we think, and where it states the releases it accepts.
+CONTRACTS = {
+    'claude': {
+        'lines': ['TARGET="$1"', '"$binary_path" install ${TARGET:+"$TARGET"}'],
+        'releases': re.compile(r'\[\[ ! "\$TARGET" =~ \^(.+?)\$ \]\]'),
+        'named': (),
+    },
+    'codex': {
+        'lines': ['--release)', 'NON_INTERACTIVE="${CODEX_NON_INTERACTIVE:-false}"',
+                  'BIN_DIR="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"', '*":$BIN_DIR:"*)', '"" | latest)'],
+        'releases': re.compile(r"grep -Eq '\^(.+?)\$'"),
+        'named': ('latest',),
+    },
+}
+
+
+def verify_installer(agent, text):
+    """Why the downloaded script cannot be run the reviewed way for agent's release; empty when it can."""
+    contract = CONTRACTS.get(agent.name)
+    if not contract:
+        return [f'there is no reviewed contract for the {agent.name} installer']
+    problems = [f'it no longer contains {line!r}' for line in contract['lines'] if line not in text]
+    found = contract['releases'].search(text)
+    if not found:
+        problems.append('it no longer states which releases it accepts')
+    elif agent.version not in contract['named']:
+        accepted = found[1].replace('[:space:]', r'\s').replace('[:digit:]', r'\d')
+        if not re.fullmatch(accepted, agent.version):
+            problems.append(f'it does not accept the release "{agent.version}"')
+    return problems
+
+
 def install_agent(agent, home, downloads, log=print):
     """Run the vendor's own installer for one CLI, as the user; returns (path, version)."""
     folder = Path(tempfile.mkdtemp(prefix=agent.name + '-', dir=downloads))
     script, digest = download(agent.installer, folder)
     log(f'  {agent.name}: downloaded {agent.installer} to {script}')
+    problems = verify_installer(agent, script.read_text(errors='replace'))
+    if problems:
+        raise RuntimeError(f'The {agent.name} installer changed since it was reviewed, so it was not run: '
+                           + '; '.join(problems) + f'. It is kept at {script}; install {agent.name} by hand '
+                           f'({agent.docs}) and run this installer again.')
     log(f'  {agent.name}: sha256 {digest}; running it for release "{agent.version}"')
     env = dict(os.environ, HOME=str(home), PATH=target_path(home, True), **agent.env)
     args = [arg.replace('{version}', agent.version) for arg in agent.args]

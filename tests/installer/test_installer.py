@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 import stat
 import subprocess
@@ -23,12 +24,12 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import support  # noqa: E402
-from installer import packages, preflight, transaction  # noqa: E402
+from installer import merges, packages, preflight, transaction  # noqa: E402
 from installer.desktop import Desktop  # noqa: E402
-from installer.engine import Options, Run, resolve_values, rollback  # noqa: E402
+from installer.engine import Options, Refused, Run, resolve_values, rollback  # noqa: E402
 from installer.fsops import Home, Unsafe  # noqa: E402
 from installer.manifest import load  # noqa: E402
-from installer.plan import Context, build  # noqa: E402
+from installer.plan import Context, Plan, build  # noqa: E402
 from installer.stage import stage  # noqa: E402
 
 support.home()
@@ -143,6 +144,17 @@ class Staging(Scratch):
         self.cli('--install', '--only', 'agents')
         self.assertIn(f'Exec="{self.home.resolve()}/.local/bin/claude" --handle-uri %u',
                       self.read('.local/share/applications/claude-code-url-handler.desktop'))
+
+    def test_target_home_never_means_the_real_home(self):
+        account = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        for target in (account, account.parent):
+            result = subprocess.run([INSTALL, '--check', '--target-home', str(target)], env=self.env,
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn('your own home or contains it', result.stderr)
+        with self.assertRaises(Refused):
+            Run(Options(home=account, real=False))
+        self.assertNothingTrapped()
 
     def test_unknown_component(self):
         self.assertIn('Unknown component', self.cli('--check', '--only', 'nothing', ok=False).stderr)
@@ -362,6 +374,60 @@ Run(Options(home=Path({str(self.home)!r}), real=False), log=lambda *a: None).ins
         self.assertEqual(snapshot(self.home), before)
         self.cli('--install')
 
+    def test_a_conflict_during_automatic_undo_is_reported_as_failed(self):
+        Preservation.populate(self)
+        before = snapshot(self.home)
+        original, calls, edited = transaction.Transaction._do, [], {}
+
+        def edit_then_fail(self_, step):
+            if calls and step['type'] == 'path':
+                # Someone edits a file the installation already replaced, then the next step fails.
+                path = edited.setdefault('path', calls[0])
+                (self.home / path).write_text('edited during the installation\n')
+                raise RuntimeError('the next step failed (simulated)')
+            original(self_, step)
+            if step['type'] == 'path' and step['after']['kind'] == 'file':
+                calls.append(step['path'])
+
+        with mock.patch.object(transaction.Transaction, '_do', edit_then_fail), \
+                contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(RuntimeError):
+            Run(Options(home=self.home, real=False)).install()
+        report = out.getvalue()
+        self.assertIn('could not undo everything', report)
+        self.assertNotIn('was put back', report)
+        self.assertIn(f'not undone: ~/{edited["path"]} changed after installation', report)
+        journal = json.loads((self.backups()[-1] / 'journal.json').read_text())
+        self.assertEqual(journal['status'], 'failed')
+        self.assertEqual(journal['recovery']['problems'], [f'~/{edited["path"]} changed after installation'])
+        self.assertIn('did not finish', self.cli('--install', ok=False).stderr)
+        self.assertIn('changed after installation', self.cli('--rollback', 'last', ok=False).stderr)
+        self.cli('--rollback', 'last', '--keep-changed')
+        now = snapshot(self.home)
+        self.assertEqual(now[edited['path']][2], b'edited during the installation\n')
+        kept = {edited['path'], *(str(p) for p in Path(edited['path']).parents if str(p) != '.')}
+        self.assertEqual({k: v for k, v in now.items() if k not in kept},
+                         {k: v for k, v in before.items() if k not in kept})
+        self.cli('--install')
+
+    def test_the_file_plan_is_checked_before_packages_and_agents(self):
+        self.write('.claude/settings.json', '{broken')
+        calls = []
+        with mock.patch.object(packages, 'missing_apt', side_effect=lambda names: calls.append('apt') or []), \
+                mock.patch.object(packages, 'missing_snaps', side_effect=lambda *a: calls.append('snap') or []), \
+                mock.patch.object(packages, 'install_agent', side_effect=lambda *a, **k: calls.append('agent')), \
+                self.assertRaises(Refused) as refused:
+            Run(Options(home=self.home, real=False, packages=True, agents=True), log=lambda *a: None).install()
+        self.assertIn('not valid JSON', str(refused.exception))
+        self.assertEqual(calls, [])
+        (self.home / '.claude/settings.json').unlink()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (self.home / '.config').symlink_to(outside)
+        with mock.patch.object(packages, 'missing_apt', side_effect=lambda names: calls.append('apt') or []), \
+                self.assertRaises(Refused):
+            Run(Options(home=self.home, real=False, packages=True), log=lambda *a: None).install()
+        self.assertEqual(calls, [])
+
     def test_corrupt_backup_is_refused(self):
         Preservation.populate(self)
         self.cli('--install')
@@ -399,6 +465,10 @@ if args[0] in ('is-enabled', 'is-active'):
     print(value)
     json.dump(state, open(path, 'w'))
     sys.exit(0 if value in ('enabled', 'active') else 1)
+if args[0] in ('restart', 'try-restart') and os.environ.get('FAKE_WATCH'):
+    state.setdefault('seen', []).append(open(os.environ['FAKE_WATCH']).read())
+if args[0] == 'try-restart':
+    args[0] = 'restart' if units.get(args[1], {}).get('active') == 'active' else 'noop'
 if args[0] in ('enable', 'disable', 'start', 'stop', 'restart'):
     unit = units.setdefault(args[1], {'enabled': 'disabled', 'active': 'inactive'})
     if args[0] in ('enable', 'disable'):
@@ -434,9 +504,9 @@ class DesktopIntegration(Scratch):
         self.settings.write_text(json.dumps(INITIAL_SETTINGS))
         self.units = self.root / 'systemctl.json'
         self.units.write_text('{}')
-        env = dict(os.environ, PATH=f'{fakes}:{os.environ["PATH"]}', FAKE_GSETTINGS=str(self.settings),
-                   FAKE_SYSTEMCTL=str(self.units))
-        self.desktop = Desktop(env=env)
+        self.fake_env = dict(os.environ, PATH=f'{fakes}:{os.environ["PATH"]}', FAKE_GSETTINGS=str(self.settings),
+                             FAKE_SYSTEMCTL=str(self.units), FAKE_WATCH=str(self.home / '.local/share/workspace/workspace.py'))
+        self.desktop = Desktop(env=self.fake_env)
         legacy = self.home / '.local/share/gnome-shell/extensions/old-clipboard@example'
         legacy.mkdir(parents=True)
         (legacy / 'metadata.json').write_text(json.dumps({'uuid': 'old-clipboard@example',
@@ -484,6 +554,98 @@ class DesktopIntegration(Scratch):
         out = self.run_install()
         self.assertIn('nothing was changed', out)
 
+    def unit(self, name):
+        return json.loads(self.units.read_text()).get('units', {}).get(name)
+
+    def test_a_setting_changed_by_a_failing_step_is_undone(self):
+        class Flaky(Desktop):
+            failed = False
+
+            def set_value(self, schema, key, value):
+                super().set_value(schema, key, value)
+                if not self.failed:
+                    self.failed = True
+                    raise OSError('gsettings crashed after writing (simulated)')
+        desktop = Flaky(env=self.fake_env)
+        steps, _ = desktop.plan_settings([('set', 'org.gnome.desktop.interface', 'accent-color', "'blue'")])
+        tx = transaction.Transaction(Home(self.home), Plan(home=self.home, components=[]), desktop)
+        tx.prepare(steps, [])
+        with self.assertRaises(OSError):
+            tx.apply()
+        self.assertEqual(self.value('org.gnome.desktop.interface accent-color'), "'orange'")
+        self.assertEqual(tx.journal['status'], 'rolled-back')
+
+    def test_a_unit_enabled_by_a_failing_step_is_undone(self):
+        class Flaky(Desktop):
+            def set_unit(self, unit, after):
+                self.command('systemctl', '--user', 'enable', unit, check=True)
+                raise OSError('the service failed to start (simulated)')
+        desktop = Flaky(env=self.fake_env)
+        steps = desktop.plan_units(['workspace-save.timer'])
+        tx = transaction.Transaction(Home(self.home), Plan(home=self.home, components=[]), desktop)
+        tx.prepare([], steps)
+        with self.assertRaises(OSError):
+            tx.apply()
+        self.assertEqual(self.unit('workspace-save.timer'), {'enabled': 'disabled', 'active': 'inactive'})
+        self.assertEqual(tx.journal['status'], 'rolled-back')
+
+    def test_a_failed_service_undo_is_not_reported_as_rolled_back(self):
+        class Flaky(Desktop):
+            def set_unit(self, unit, after):
+                self.command('systemctl', '--user', 'enable', unit, check=True)
+                raise OSError('start failed (simulated)')
+
+            def command(self, *args, check=False):
+                if 'disable' in args:
+                    result = subprocess.CompletedProcess(args, 1, '', 'disable failed')
+                    if check:
+                        result.check_returncode()
+                    return result
+                return super().command(*args, check=check)
+
+        desktop = Flaky(env=self.fake_env)
+        tx = transaction.Transaction(Home(self.home), Plan(home=self.home, components=[]), desktop)
+        tx.prepare([], desktop.plan_units(['workspace-save.timer']))
+        with self.assertRaises(OSError):
+            tx.apply()
+        self.assertEqual(tx.journal['status'], 'failed')
+        self.assertIn('disable', tx.journal['recovery']['undo_error'])
+        self.assertEqual(self.unit('workspace-save.timer')['enabled'], 'enabled')
+
+    def test_services_restart_on_the_restored_files(self):
+        old = self.home / '.local/share/workspace/workspace.py'
+        old.parent.mkdir(parents=True)
+        old.write_text('# the previous workspace code\n')
+        self.units.write_text(json.dumps({'units': {'workspace-monitor.service': {'enabled': 'enabled', 'active': 'active'}}}))
+        self.run_install()
+        state = json.loads(self.units.read_text())
+        self.assertNotEqual(state['seen'][-1], '# the previous workspace code\n')   # restarted on the new code
+        installed_log = len(state['log'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop)
+        state = json.loads(self.units.read_text())
+        after = state['log'][installed_log:]
+        self.assertEqual(state['seen'][-1], '# the previous workspace code\n')        # restarted after the files
+        self.assertLess(after.index('daemon-reload'), after.index('try-restart workspace-monitor.service'))
+        self.assertLess(after.index('stop workspace-save.timer'), after.index('daemon-reload'))
+        self.assertEqual(self.unit('workspace-monitor.service'), {'enabled': 'enabled', 'active': 'active'})
+
+    def test_a_service_changed_later_is_not_overwritten(self):
+        self.run_install()
+        state = json.loads(self.units.read_text())
+        state['units']['workspace-save.timer'] = {'enabled': 'masked', 'active': 'inactive'}
+        self.units.write_text(json.dumps(state))
+        with self.assertRaises(transaction.RollbackRefused) as refused:
+            rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop)
+        self.assertIn('service workspace-save.timer changed after installation', str(refused.exception))
+        self.assertTrue((self.home / '.local/bin/workspace-control').exists())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop, keep_changed=True)
+        self.assertIn('workspace-save.timer changed after installation (now masked) (kept)', out.getvalue())
+        self.assertEqual(self.unit('workspace-save.timer'), {'enabled': 'masked', 'active': 'inactive'})
+        self.assertEqual(self.unit('ai-memory-snapshot.timer'), {'enabled': 'disabled', 'active': 'inactive'})
+        self.assertFalse((self.home / '.local/bin/workspace-control').exists())
+
 
 class Platform(unittest.TestCase):
     SUPPORTED = load().supported
@@ -501,28 +663,47 @@ class Platform(unittest.TestCase):
 
 
 class AgentCLIs(unittest.TestCase):
+    # Stand-ins with the interface lines the reviewed official scripts have (see packages.CONTRACTS).
     CLAUDE = '''#!/bin/bash
-[ "$1" = "stable" ] || { echo "unexpected release $1" >&2; exit 3; }
+TARGET="$1"  # Optional target parameter
+if [[ -n "$TARGET" ]] && [[ ! "$TARGET" =~ ^(stable|latest|[0-9]+\\.[0-9]+\\.[0-9]+(-[^[:space:]]+)?)$ ]]; then exit 1; fi
+[ "$TARGET" = "stable" ] || { echo "unexpected release $TARGET" >&2; exit 3; }
 mkdir -p "$HOME/.local/bin"
 printf '#!/bin/sh\\necho "9.9.9 (Claude Code)"\\n' > "$HOME/.local/bin/claude"
 chmod +x "$HOME/.local/bin/claude"
+: '"$binary_path" install ${TARGET:+"$TARGET"}'
 '''
     CODEX = '''#!/bin/sh
-[ "$1" = "--release" ] && [ "$2" = "1.2.3" ] && [ "$CODEX_NON_INTERACTIVE" = "1" ] || exit 3
-mkdir -p "$HOME/.local/bin"
-printf '#!/bin/sh\\necho "codex-cli 1.2.3"\\n' > "$HOME/.local/bin/codex"
-chmod +x "$HOME/.local/bin/codex"
+NON_INTERACTIVE="${CODEX_NON_INTERACTIVE:-false}"
+BIN_DIR="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"
+case "$2" in "" | latest) ;; esac
+case ":$PATH:" in *":$BIN_DIR:"*) ;; esac
+printf '%s\\n' "$2" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+(-alpha(\\.[0-9]+){0,2}|-beta(\\.[0-9]+)?)?$' || exit 1
+case "$1" in --release) ;; *) exit 3 ;; esac
+[ "$2" = "1.2.3" ] && [ "$NON_INTERACTIVE" = "1" ] || exit 3
+mkdir -p "$BIN_DIR"
+printf '#!/bin/sh\\necho "codex-cli 1.2.3"\\n' > "$BIN_DIR/codex"
+chmod +x "$BIN_DIR/codex"
 '''
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix='workbench-agents-'))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
-        site = self.root / 'site'
+        site = self.site = self.root / 'site'
         for name, body in (('claude', self.CLAUDE), ('codex', self.CODEX)):
             (site / name).mkdir(parents=True)
             (site / name / 'install.sh').write_text(body)
-        handler = lambda *a, **k: http.server.SimpleHTTPRequestHandler(*a, directory=str(site), **k)  # noqa: E731
-        http.server.SimpleHTTPRequestHandler.log_message = lambda *a: None
+        class Vendor(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                if 'Python-urllib' in self.headers.get('User-Agent', ''):   # as the real download hosts do
+                    self.send_error(403)
+                    return
+                super().do_GET()
+
+            def log_message(self, *args):
+                pass
+
+        handler = lambda *a, **k: Vendor(*a, directory=str(site), **k)  # noqa: E731
         self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -547,6 +728,33 @@ chmod +x "$HOME/.local/bin/codex"
         kept = sorted(p.name for p in self.downloads.glob('*/*'))
         self.assertEqual(kept, ['SHA256SUMS', 'SHA256SUMS', 'install.sh', 'install.sh'])
 
+    def test_a_changed_installer_is_not_run(self):
+        changed = self.CLAUDE.replace('TARGET="$1"', 'TARGET="${1:-}"').replace('mkdir -p', 'touch "$HOME/ran"; mkdir -p')
+        (self.site / 'claude/install.sh').write_text(changed)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError) as refused:
+            packages.install_agent(self.agent('claude', 'stable'), self.home, self.downloads)
+        self.assertIn('changed since it was reviewed', str(refused.exception))
+        self.assertFalse((self.home / 'ran').exists())
+
+    def test_a_release_the_installer_rejects_is_not_run(self):
+        agent = self.agent('codex', '1.2.3')
+        text = self.CODEX.replace('-beta', '-rc')
+        self.assertEqual(packages.verify_installer(agent, text), [])
+        agent.version = '1.2.3-beta.1'
+        self.assertIn('does not accept the release "1.2.3-beta.1"', packages.verify_installer(agent, text)[0])
+
+    @unittest.skipUnless(os.environ.get('WORKBENCH_ONLINE') == '1', 'set WORKBENCH_ONLINE=1 to fetch the real installers')
+    def test_the_official_installers_still_fit(self):
+        """Downloads (never runs) the vendors' current scripts and checks the reviewed interface."""
+        component = load().components['agents']
+        samples = {'claude': ['latest', 'stable', '2.1.89'], 'codex': ['latest', '0.162.1', '0.163.0-beta.1']}
+        for name, releases in samples.items():
+            for release in releases:
+                agent = next(a for a in packages.agents_from(component, {name: release}) if a.name == name)
+                script, _ = packages.download(agent.installer, self.downloads)
+                self.assertEqual(packages.verify_installer(agent, script.read_text()), [], (name, release))
+                script.unlink()
+
     def test_a_failing_installer_is_reported(self):
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
             packages.install_agent(self.agent('claude', 'latest'), self.home, self.downloads)
@@ -570,6 +778,32 @@ chmod +x "$HOME/.local/bin/codex"
     def test_release_names_are_checked(self):
         with self.assertRaises(ValueError):
             packages.agents_from(load().components['agents'], {'codex': 'stable; rm -rf ~'})
+
+
+class ClaudeHooks(unittest.TestCase):
+    HOOK = {'type': 'command', 'command': '/home/x/.local/bin/workspace-control hook', 'timeout': 3}
+    WANTED = json.dumps({'hooks': {'PreToolUse': [{'hooks': [HOOK]}]}})
+
+    def merged(self, groups):
+        result = json.loads(merges.claude_settings(json.dumps({'hooks': {'PreToolUse': groups}}), self.WANTED))
+        return result['hooks']['PreToolUse']
+
+    def test_a_restricted_group_does_not_count_as_the_general_hook(self):
+        restricted = {'matcher': 'Bash', 'hooks': [dict(self.HOOK)]}
+        self.assertEqual(self.merged([restricted]), [restricted, {'hooks': [self.HOOK]}])
+
+    def test_an_equivalent_general_group_is_kept_as_it_is(self):
+        for matcher in ({}, {'matcher': ''}, {'matcher': '*'}):
+            general = {**matcher, 'hooks': [{'type': 'command', 'command': self.HOOK['command'], 'timeout': 10}]}
+            self.assertEqual(self.merged([general]), [general])
+
+    def test_a_different_hook_type_is_not_the_same_hook(self):
+        prompt = {'hooks': [{'type': 'prompt', 'prompt': 'check', 'command': self.HOOK['command']}]}
+        self.assertEqual(len(self.merged([prompt])), 2)
+
+    def test_merging_twice_changes_nothing(self):
+        once = merges.claude_settings('{}', self.WANTED)
+        self.assertEqual(merges.claude_settings(once, self.WANTED), once)
 
 
 if __name__ == '__main__':

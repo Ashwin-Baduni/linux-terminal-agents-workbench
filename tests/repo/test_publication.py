@@ -81,6 +81,26 @@ class History(Scratch):
                                         capture_output=True, env=self.env).returncode, 0)
         self.assertIn('notes.txt (history', self.check(repo).stdout)
 
+    def test_secret_values_are_redacted_in_the_report(self):
+        repo = self.git_repo()
+        token = 'sk-ant-' + 'Zq9Xw2Lm7Rt4' * 4
+        (repo / 'config.py').write_text(f'KEY = "{token}"\n')
+        self.commit(repo, 'some-user', '1+some-user@users.noreply.github.com')
+        result = self.check(repo)
+        self.assertIn('Anthropic key: sk-a… (', result.stdout)
+        self.assertNotIn(token, result.stdout + result.stderr)
+        self.assertNotIn(token[:20], result.stdout + result.stderr)
+
+    def test_a_removed_credential_file_is_found_in_history(self):
+        repo = self.git_repo()
+        (repo / '.env').write_text('MODE=dev\n')
+        self.commit(repo, 'some-user', '1+some-user@users.noreply.github.com')
+        (repo / '.env').unlink()
+        self.commit(repo, 'some-user', '1+some-user@users.noreply.github.com', 'Remove it')
+        result = self.check(repo)
+        self.assertIn('.env (history', result.stdout)
+        self.assertIn('looks like personal state, a credential or a build leftover', result.stdout)
+
     def test_bad_pattern_file_is_explained(self):
         self.patterns.write_text('*broken\n')
         result = self.check(self.git_repo())

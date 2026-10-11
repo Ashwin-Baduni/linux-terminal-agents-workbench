@@ -29,9 +29,11 @@ def parse(argv):
     mode.add_argument('--install', action='store_true', help='install the selected components')
     mode.add_argument('--rollback', metavar='BACKUP',
                       help='restore a backup folder printed by an installation, or "last"')
+    parser.add_argument('--keep-changed', action='store_true',
+                        help='with --rollback: keep files and settings changed since, restore the rest')
     parser.add_argument('--only', metavar='LIST', help='comma-separated components; their requirements are added')
     parser.add_argument('--target-home', type=Path, metavar='DIR',
-                        help="install into another folder instead of your home: files only, nothing on this system")
+                        help="stage into a separate folder instead of your home: files only, nothing on this system")
     parser.add_argument('--no-activate', action='store_true',
                         help='files only: no packages, agent CLIs, GNOME settings or services')
     parser.add_argument('--agent-policy', choices=['full-access'],
@@ -45,17 +47,23 @@ def main(argv=None):
     parser, args = parse(sys.argv[1:] if argv is None else argv)
     account = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     home = (args.target_home or account).expanduser().resolve()
-    real = home == account
+    real = args.target_home is None      # an explicit --target-home always means staging
     activate = real and not args.no_activate
     components = [c.strip() for c in args.only.split(',') if c.strip()] if args.only else None
     options = Options(home=home, real=real, components=components, agent_policy=args.agent_policy,
                       versions={k: v for k, v in (('claude', args.claude_version), ('codex', args.codex_version)) if v},
                       packages=activate, agents=activate, desktop=activate)
     try:
-        if args.target_home and not real and not home.is_dir():
-            raise Refused(f'{home} does not exist; create the staging folder first.')
+        if args.target_home is not None:
+            if account.is_relative_to(home):
+                raise Refused(f'--target-home {home} is your own home or contains it; staging needs a separate '
+                              'folder. To install for yourself, leave --target-home out.')
+            if not home.is_dir():
+                raise Refused(f'{home} does not exist; create the staging folder first.')
+        if args.keep_changed and not args.rollback:
+            raise Refused('--keep-changed goes with --rollback.')
         if args.rollback:
-            return rollback(options, args.rollback)
+            return rollback(options, args.rollback, keep_changed=args.keep_changed)
         run = Run(options)
         return run.install() if args.install else run.check()
     except (Refused, RollbackRefused, Interrupted, ManifestError, Unsafe, ValueError) as error:

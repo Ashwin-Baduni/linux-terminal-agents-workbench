@@ -66,11 +66,15 @@ def history_commits(repo):
             yield fields
 
 
+def forbidden_name(name):
+    parts = Path(name).parts
+    return any(fnmatch.fnmatchcase(parts[-1], pattern) for pattern in FORBIDDEN_FILES) or bool(FORBIDDEN_PARTS & set(parts))
+
+
 def scan_file(repo, name):
     findings = []
     path = repo / name
-    parts = Path(name).parts
-    if any(fnmatch.fnmatchcase(parts[-1], pattern) for pattern in FORBIDDEN_FILES) or FORBIDDEN_PARTS & set(parts):
+    if forbidden_name(name):
         findings.append(f'{name}: looks like personal state, a credential or a build leftover')
     if path.is_symlink():
         target = os.readlink(path)
@@ -98,8 +102,12 @@ def check(repo, history=False, pattern_files=()):
             findings += public_scan.scan_text(name, name, data, found, allowlist)
     versions = commits = 0
     if history:
+        flagged = set()
         for label, name, data in history_files(repo):
             versions += 1
+            if forbidden_name(name) and name not in flagged:
+                flagged.add(name)
+                findings.append(f'{label}: looks like personal state, a credential or a build leftover')
             findings += public_scan.scan_text(label, name, data, found, allowlist)
         for sha, author, author_email, committer, committer_email, message in history_commits(repo):
             commits += 1

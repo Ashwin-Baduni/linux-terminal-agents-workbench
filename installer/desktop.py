@@ -79,8 +79,9 @@ class Desktop:
         active = self.command('systemctl', '--user', 'is-active', unit).stdout.strip() or 'unknown'
         return {'enabled': enabled, 'active': active}
 
-    def reload(self):
-        if not self.reloaded:
+    def reload(self, force=False):
+        """Make systemd read the unit files; force after a rollback has put old files back."""
+        if force or not self.reloaded:
             self.command('systemctl', '--user', 'daemon-reload', check=True)
             self.reloaded = True
 
@@ -98,16 +99,6 @@ class Desktop:
         self.reload()
         self.command('systemctl', '--user', 'enable', unit, check=True)
         self.command('systemctl', '--user', 'restart' if after.get('restart') else 'start', unit, check=True)
-
-    def restore_unit(self, unit, before, after):
-        self.reload()
-        if before.get('active') != 'active':
-            self.command('systemctl', '--user', 'stop', unit)
-        elif after.get('restart'):
-            self.command('systemctl', '--user', 'try-restart', unit)   # back on the restored files
-        if before.get('enabled') not in ('enabled', 'static', 'alias'):
-            self.command('systemctl', '--user', 'disable', unit)
-
 
 def extensions_with_schema(home, schema, exclude):
     """UUIDs of other installed GNOME extensions that declare the same settings schema."""
