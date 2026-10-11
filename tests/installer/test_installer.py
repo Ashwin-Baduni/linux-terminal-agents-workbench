@@ -1045,6 +1045,33 @@ chmod +x "$BIN_DIR/codex"
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
             packages.install_agent(self.agent('claude', 'latest'), self.home, self.downloads)
 
+    def test_an_installer_that_leaves_a_broken_cli_is_not_successful(self):
+        script = self.CLAUDE.replace('echo "9.9.9 (Claude Code)"', 'exit 139')
+        (self.site / 'claude/install.sh').write_text(script)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, 'exit 139'):
+            packages.install_agent(self.agent('claude', 'stable'), self.home, self.downloads)
+
+    def test_existing_unusable_clis_require_repair_without_being_overwritten(self):
+        binary = self.home / '.local/bin/claude'
+        binary.parent.mkdir(parents=True)
+        for body, message in (('#!/bin/sh\nexit 139\n', 'exit 139'),
+                              ('#!/bin/sh\nexit 0\n', 'no version output'),
+                              ('not an executable format\n', 'could not finish')):
+            with self.subTest(message=message):
+                binary.write_text(body)
+                binary.chmod(0o755)
+                run = Run(Options(home=self.home, real=False, agents=True))
+                with mock.patch.object(packages, 'download', side_effect=AssertionError('downloaded')), \
+                        self.assertRaisesRegex(RuntimeError, message):
+                    run.install_agents()
+                self.assertEqual(binary.read_text(), body)
+
+    def test_version_timeout_reports_repair_instructions(self):
+        with mock.patch.object(packages.subprocess, 'run',
+                               side_effect=subprocess.TimeoutExpired(['claude', '--version'], 60)), \
+                self.assertRaisesRegex(RuntimeError, 'Repair that CLI'):
+            packages.version_of('claude')
+
     def test_only_https_or_a_local_test_server(self):
         with self.assertRaises(ValueError):
             packages.download('http://example.com/install.sh', self.downloads)

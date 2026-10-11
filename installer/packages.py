@@ -53,8 +53,17 @@ def find(name, home, real):
 
 
 def version_of(binary, env=None):
-    result = subprocess.run([binary, '--version'], capture_output=True, text=True, env=env, timeout=60)
-    return (result.stdout or result.stderr).strip().splitlines()[0] if result.returncode == 0 else 'unknown'
+    """Require a working CLI before reporting it as installed, including an existing executable."""
+    remedy = f'Repair that CLI with its vendor installer, then run this installer again: {binary}'
+    try:
+        result = subprocess.run([binary, '--version'], capture_output=True, text=True, env=env, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f'{binary} --version could not finish ({error}). {remedy}') from error
+    lines = (result.stdout.strip() or result.stderr.strip()).splitlines()
+    if result.returncode or not lines:
+        reason = f'exit {result.returncode}' if result.returncode else 'no version output'
+        raise RuntimeError(f'{binary} --version failed ({reason}). {remedy}')
+    return lines[0]
 
 
 def download(url, folder):
