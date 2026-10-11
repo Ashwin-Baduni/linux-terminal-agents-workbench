@@ -30,7 +30,7 @@ PROJECTS = ROOT / 'projects'
 INDEX = ROOT / 'MEMORY.md'
 MARKER = '.ai-memory'
 SETTINGS = '.claude/settings.local.json'
-CLAUDE_PROJECTS = HOME / '.claude/projects'
+CLAUDE_PROJECTS = Path(os.environ.get('CLAUDE_CONFIG_DIR') or HOME / '.claude').expanduser() / 'projects'
 # Outside ~/ai-memory so the snapshot timer never commits it.
 LOCK = HOME / '.local/state/ai-memory/index.lock'
 # Global git ignore patterns; ** so a project folder deeper inside a repository is covered too.

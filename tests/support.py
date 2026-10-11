@@ -23,8 +23,9 @@ from installer.stage import MARKER, stage  # noqa: E402
 def environment(home):
     """The environment for a suite running inside a staged home."""
     env = {key: value for key, value in os.environ.items()
-           if key not in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME')}
-    env.update(HOME=str(home), WORKBENCH_STAGE=str(home), PYTHONDONTWRITEBYTECODE='1')
+           if key not in ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME',
+                          'CODEX_HOME', 'CLAUDE_CONFIG_DIR') and not key.startswith('GIT_')}
+    env.update(HOME=str(home), WORKBENCH_STAGE=str(home), PYTHONDONTWRITEBYTECODE='1', GIT_CONFIG_NOSYSTEM='1')
     return env
 
 

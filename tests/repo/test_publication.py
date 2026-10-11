@@ -81,6 +81,16 @@ class History(Scratch):
                                         capture_output=True, env=self.env).returncode, 0)
         self.assertIn('notes.txt (history', self.check(repo).stdout)
 
+    def test_every_historical_filename_is_checked_even_for_identical_blobs(self):
+        repo = self.git_repo()
+        (repo / 'auth.json').write_text('hello\n')  # identical to README.md, hence the same Git blob
+        self.commit(repo, 'some-user', '1+some-user@users.noreply.github.com')
+        (repo / 'auth.json').unlink()
+        self.commit(repo, 'some-user', '1+some-user@users.noreply.github.com', 'Remove runtime file')
+        result = self.check(repo)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('auth.json (history', result.stdout)
+
     def test_secret_values_are_redacted_in_the_report(self):
         repo = self.git_repo()
         token = 'sk-ant-' + 'Zq9Xw2Lm7Rt4' * 4

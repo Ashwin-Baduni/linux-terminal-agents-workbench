@@ -155,7 +155,6 @@ def _blob(home, step):
     return data
 
 
-ENABLED = ('enabled', 'enabled-runtime', 'static', 'alias', 'linked', 'linked-runtime')
 RUNNING = ('active', 'activating', 'reloading')
 
 
@@ -212,13 +211,15 @@ def _setting(desktop, step, plan):
         plan.problems.append(f'{name} changed after installation (now {current})')
 
 
-def _unit(desktop, step, plan):
+def _unit(desktop, step, plan, partial=False):
     unit, before, after = step['unit'], step['before'], step['after']
     current = desktop.unit_state(unit)
-    action = {'unit': unit, 'stop': False, 'disable': False, 'restart': False}
+    action = {'unit': unit, 'stop': False, 'disable': False, 'restart': False,
+              'start': False, 'enable_runtime': False}
     if current['enabled'] != before['enabled']:
-        if current['enabled'] == after['enabled'] and before['enabled'] not in ENABLED:
+        if current['enabled'] == after['enabled']:
             action['disable'] = True
+            action['enable_runtime'] = before['enabled'] == 'enabled-runtime'
         elif current['enabled'] != after['enabled']:
             plan.problems.append(f'service {unit} changed after installation (now {current["enabled"]})')
             return
@@ -227,9 +228,11 @@ def _unit(desktop, step, plan):
     elif after.get('restart'):
         if current['active'] in RUNNING:
             action['restart'] = True
+        elif partial:
+            action['start'] = True
         else:
             plan.left.append(f'service {unit} (stopped since installing; left stopped)')
-    if action['stop'] or action['disable'] or action['restart']:
+    if any(action[key] for key in ('stop', 'disable', 'restart', 'start', 'enable_runtime')):
         plan.units.append(action)
 
 
@@ -251,7 +254,7 @@ def preflight(home, journal, desktop):
         elif step['type'] == 'gsetting':
             _setting(desktop, step, plan)
         elif step['type'] == 'unit':
-            _unit(desktop, step, plan)
+            _unit(desktop, step, plan, number == in_flight)
     return plan
 
 
@@ -293,6 +296,10 @@ def restore(home, journal, desktop, automatic=False, keep_changed=False):
     if plan.units:
         desktop.reload(force=True)                # read the restored unit files
         for action in plan.units:
+            if action['enable_runtime']:
+                desktop.command('systemctl', '--user', 'enable', '--runtime', action['unit'], check=True)
+            if action['start']:
+                desktop.command('systemctl', '--user', 'start', action['unit'], check=True)
             if action['restart']:
                 desktop.command('systemctl', '--user', 'try-restart', action['unit'], check=True)
             plan.restored.append(action['unit'])

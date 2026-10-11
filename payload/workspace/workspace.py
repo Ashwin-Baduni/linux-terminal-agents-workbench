@@ -912,7 +912,7 @@ def pane_output(target, action):
         open_file(path)
 
 
-CODEX_SESSIONS = HOME / '.codex/sessions'
+CODEX_SESSIONS = Path(os.environ.get('CODEX_HOME') or HOME / '.codex').expanduser() / 'sessions'
 CLAUDE_TOOLS = {'Bash': ('ran', 'command'), 'Read': ('read', 'file_path'), 'Edit': ('edited', 'file_path'),
                 'MultiEdit': ('edited', 'file_path'), 'Write': ('wrote', 'file_path'),
                 'NotebookEdit': ('edited', 'notebook_path'), 'Grep': ('searched for', 'pattern'),

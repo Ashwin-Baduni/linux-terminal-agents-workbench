@@ -241,6 +241,28 @@ class MemoryTemplates(unittest.TestCase):
         self.assertIn('@~/ai-memory/MEMORY.md', (REPO / 'templates/memory/CLAUDE.md').read_text())
 
 
+class AgentProfiles(unittest.TestCase):
+    def test_runtime_readers_follow_the_installed_agent_profile(self):
+        root = scratch(self)
+        codex = root / 'custom-codex'
+        claude = root / 'custom-claude'
+        codex.mkdir()
+        (codex / 'models_cache.json').write_text(json.dumps({'models': [
+            {'visibility': 'list', 'slug': 'test-model', 'display_name': 'Test model'}]}))
+        env = dict(support.environment(HOME), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(claude))
+        script = '''import json, os, runpy
+from pathlib import Path
+h=Path.home()
+pair=runpy.run_path(str(h/'.local/bin/agent-pair'))
+workspace=runpy.run_path(str(h/'.local/share/workspace/workspace.py'))
+memory=runpy.run_path(str(h/'.local/bin/ai-memory'))
+print(json.dumps([pair['codex_models'](), str(workspace['CODEX_SESSIONS']), str(memory['CLAUDE_PROJECTS'])]))
+'''
+        result = subprocess.run([sys.executable, '-c', script], env=env, capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), [[['test-model', 'Test model']],
+                                                    str(codex / 'sessions'), str(claude / 'projects')])
+
+
 
 class ThirdParty(unittest.TestCase):
     def test_inventory_matches_the_tree(self):

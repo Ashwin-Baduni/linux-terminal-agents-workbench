@@ -125,10 +125,12 @@ class Run:
             return [], [], []
         settings, skipped = self.desktop.plan_settings(desktop_operations(self.manifest, self.chosen, self.home.root))
         changed = {c.path for c in plan.changes}
-        restart = {'workspace-monitor.service'} if any(
-            p in changed for p in ('.local/share/workspace/workspace.py', '.config/systemd/user/workspace-monitor.service')) \
-            else set()
-        units = self.desktop.plan_units(units_for(self.manifest, self.chosen), restart)
+        names = units_for(self.manifest, self.chosen)
+        restart = {name for name in names if f'.config/systemd/user/{name}' in changed or
+                   (name.endswith('.timer') and f'.config/systemd/user/{name[:-6]}.service' in changed)}
+        if changed & {'.local/share/workspace/workspace.py', '.local/bin/workspace-control'}:
+            restart.add('workspace-monitor.service')
+        units = self.desktop.plan_units(names, restart)
         return settings, units, skipped
 
     # --- check ---------------------------------------------------------------

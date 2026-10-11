@@ -50,11 +50,16 @@ def committable(repo):
 
 def history_files(repo):
     """(label, path, bytes) for every file version reachable from any ref."""
-    objects = git(repo, 'rev-list', '--objects', '--all', text=True).stdout.splitlines()
-    for line in objects:
-        sha, _, name = line.partition(' ')
-        if name and git(repo, 'cat-file', '-t', sha, text=True).stdout.strip() == 'blob':
-            yield f'{name} (history {sha[:10]})', name, git(repo, 'cat-file', 'blob', sha).stdout
+    seen = set()
+    for commit in git(repo, 'rev-list', '--all', text=True, check=True).stdout.splitlines():
+        tree = git(repo, 'ls-tree', '-rz', '--full-tree', commit, check=True).stdout
+        for item in filter(None, tree.split(b'\0')):
+            metadata, name = item.split(b'\t', 1)
+            _, kind, sha = metadata.decode().split()
+            name = os.fsdecode(name)
+            if kind == 'blob' and (sha, name) not in seen:
+                seen.add((sha, name))
+                yield f'{name} (history {sha[:10]})', name, git(repo, 'cat-file', 'blob', sha, check=True).stdout
 
 
 def history_commits(repo):

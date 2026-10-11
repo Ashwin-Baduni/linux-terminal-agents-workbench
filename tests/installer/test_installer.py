@@ -458,6 +458,8 @@ path = os.environ['FAKE_SYSTEMCTL']
 state = json.load(open(path))
 args = [a for a in sys.argv[1:] if a != '--user']
 state.setdefault('log', []).append(' '.join(args))
+runtime = '--runtime' in args
+args = [a for a in args if a != '--runtime']
 units = state.setdefault('units', {})
 if args[0] in ('is-enabled', 'is-active'):
     unit = units.get(args[1], {'enabled': 'disabled', 'active': 'inactive'})
@@ -472,7 +474,7 @@ if args[0] == 'try-restart':
 if args[0] in ('enable', 'disable', 'start', 'stop', 'restart'):
     unit = units.setdefault(args[1], {'enabled': 'disabled', 'active': 'inactive'})
     if args[0] in ('enable', 'disable'):
-        unit['enabled'] = args[0] + 'd'
+        unit['enabled'] = 'enabled-runtime' if args[0] == 'enable' and runtime else args[0] + 'd'
     else:
         unit['active'] = 'inactive' if args[0] == 'stop' else 'active'
 json.dump(state, open(path, 'w'))
@@ -554,6 +556,20 @@ class DesktopIntegration(Scratch):
         out = self.run_install()
         self.assertIn('nothing was changed', out)
 
+    def test_updated_active_timer_is_reloaded_and_restarted(self):
+        self.run_install()
+        timer = self.home / '.config/systemd/user/workspace-save.timer'
+        timer.write_text(timer.read_text().replace('10min', '2min'))
+        state = json.loads(self.units.read_text())
+        previous = len(state['log'])
+        # A new invocation has its own daemon-reload tracking.
+        self.desktop = Desktop(env=self.fake_env)
+        self.run_install()
+        after = json.loads(self.units.read_text())['log'][previous:]
+        self.assertIn('restart workspace-save.timer', after)
+        self.assertLess(after.index('daemon-reload'), after.index('restart workspace-save.timer'))
+        self.assertIn('10min', timer.read_text())
+
     def unit(self, name):
         return json.loads(self.units.read_text()).get('units', {}).get(name)
 
@@ -629,6 +645,34 @@ class DesktopIntegration(Scratch):
         self.assertLess(after.index('daemon-reload'), after.index('try-restart workspace-monitor.service'))
         self.assertLess(after.index('stop workspace-save.timer'), after.index('daemon-reload'))
         self.assertEqual(self.unit('workspace-monitor.service'), {'enabled': 'enabled', 'active': 'active'})
+
+    def test_failed_restart_recovers_a_previously_running_service(self):
+        unit = 'workspace-monitor.service'
+        self.units.write_text(json.dumps({'units': {unit: {'enabled': 'enabled', 'active': 'active'}}}))
+
+        class Flaky(Desktop):
+            def set_unit(self, unit, after):
+                self.command('systemctl', '--user', 'stop', unit, check=True)
+                raise OSError('restart failed after stopping (simulated)')
+
+        desktop = Flaky(env=self.fake_env)
+        tx = transaction.Transaction(Home(self.home), Plan(home=self.home, components=[]), desktop)
+        tx.prepare([], desktop.plan_units([unit], restart=[unit]))
+        with self.assertRaises(OSError):
+            tx.apply()
+        self.assertEqual(self.unit(unit), {'enabled': 'enabled', 'active': 'active'})
+        self.assertEqual(tx.journal['status'], 'rolled-back')
+
+    def test_runtime_enablement_is_restored_after_files(self):
+        unit = 'workspace-save.timer'
+        before = {'enabled': 'enabled-runtime', 'active': 'active'}
+        self.units.write_text(json.dumps({'units': {unit: before}}))
+        tx = transaction.Transaction(Home(self.home), Plan(home=self.home, components=[]), self.desktop)
+        folder = tx.prepare([], self.desktop.plan_units([unit]))
+        tx.apply()
+        self.assertEqual(self.unit(unit)['enabled'], 'enabled')
+        transaction.rollback(Home(self.home), folder, self.desktop)
+        self.assertEqual(self.unit(unit), before)
 
     def test_a_service_changed_later_is_not_overwritten(self):
         self.run_install()
