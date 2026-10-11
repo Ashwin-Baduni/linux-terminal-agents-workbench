@@ -134,5 +134,5 @@ This writes and merges files inside `/tmp/try-home` only. It installs no package
 - The home path must not contain spaces or shell characters, because it is written into desktop entries and configuration files.
 - Planning does not need Git: without it, the installer reads `core.excludesFile` straight from your Git configuration files. Git `include` directives are not followed in that case. Once Git has been installed, the plan is made again with Git itself.
 - Before installing any package or agent CLI, the installer works out every file change. A broken settings file or an unsafe symlink therefore stops it before anything else happens.
-- Fresh-desktop behaviour has to be rehearsed on a disposable Ubuntu 26.04 machine: the GNOME session, glyphs, the clipboard extension after login, and the real agent installers and sign-ins. The automated tests use stand-ins for the desktop, services and vendor installers.
+- A disposable Ubuntu 26.04 / GNOME 50 Wayland rehearsal passed real installation, desktop, memory and rollback checks. [The verification record](verification.md) lists exact coverage and versions. Sign-ins and authenticated agent pairs still require your accounts; automated relay tests use stand-ins.
 - Hide Top Bar, display tuning and other personal machine settings are not included.

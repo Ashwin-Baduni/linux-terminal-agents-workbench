@@ -17,6 +17,7 @@ Running without arguments shows the plan. `--install` installs what is missing, 
 - [Shared memory](docs/memory.md): one place for both agents, stable project names and reinstall recovery.
 - [Fonts and colours](docs/appearance.md): the shipped appearance and its source files.
 - [Maintaining the setup](docs/maintenance.md): reviewed imports, tests and publication checks.
+- [Verification record](docs/verification.md): automated results, the real Ubuntu desktop rehearsal and its limits.
 
 The memory starts empty. This repository contains the setup machinery, with no personal notes, credentials or conversations.
 
