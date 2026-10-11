@@ -18,6 +18,15 @@ UNIT_FOLDER = '.config/systemd/user/'
 SYSTEM_UNIT_DIRS = (Path('/etc/systemd/user'), Path('/run/systemd/user'))
 
 
+def runtime_unit_dirs(home, env):
+    """The user's own other unit folders, where `systemctl --user mask [--runtime]` can also put a mask."""
+    folders = [Path(home) / '.config/systemd/user.control']
+    if env.get('XDG_RUNTIME_DIR'):
+        runtime = Path(env['XDG_RUNTIME_DIR'])
+        folders += [runtime / 'systemd/user.control', runtime / 'systemd/user']
+    return folders
+
+
 class PlanError(ValueError):
     pass
 
@@ -63,6 +72,7 @@ class Context:
     real: bool = False              # installing into the account's own home
     env: dict = field(default_factory=dict)
     agent_policy: str | None = None
+    masked: dict = field(default_factory=dict)   # unit -> state systemd reported (real installs and activation)
 
     def remap(self, target):
         """Honour CODEX_HOME and CLAUDE_CONFIG_DIR on a real installation."""
@@ -87,11 +97,13 @@ def mask_of(context, target):
     state = context.home.state(target)
     if state.kind == 'symlink' and os.path.realpath(context.home.root / target) == os.devnull:
         return 'you masked it: its unit file links to /dev/null'
+    if name in context.masked:
+        return f'systemd reports it as {context.masked[name]}'
     if context.real:
-        for folder in SYSTEM_UNIT_DIRS:
+        for folder in (*SYSTEM_UNIT_DIRS, *runtime_unit_dirs(context.home.root, context.env)):
             path = folder / name
             if path.is_symlink() and os.path.realpath(path) == os.devnull:
-                return f'it is masked for every user in {folder}, and a unit file here would override that'
+                return f'it is masked in {folder}, and a unit file in ~/.config/systemd/user must not undo that'
     return None
 
 

@@ -225,7 +225,8 @@ def _setting(desktop, step, plan):
         plan.problems.append(f'{name} changed after installation (now {current})')
 
 
-def _unit(desktop, step, plan, partial=False, retrying=False):
+def _unit(desktop, step, plan, partial=False, intended=False):
+    """intended: an earlier rollback attempt of this journal set out to bring this service back."""
     unit, before, after = step['unit'], step['before'], step['after']
     current = desktop.unit_state(unit)
     action = {'unit': unit, 'stop': False, 'disable': False, 'restart': False,
@@ -242,8 +243,8 @@ def _unit(desktop, step, plan, partial=False, retrying=False):
     elif after.get('restart'):
         if current['active'] in RUNNING:
             action['restart'] = True
-        elif partial or retrying:
-            # The installation's own restart (or an earlier rollback's) left it stopped.
+        elif partial or intended:
+            # The installation's own restart, or an earlier rollback's, left it stopped.
             action['start'] = True
         else:
             plan.left.append(f'service {unit} (stopped since installing; left stopped)')
@@ -251,9 +252,17 @@ def _unit(desktop, step, plan, partial=False, retrying=False):
         plan.units.append(action)
 
 
+def pending_services(journal):
+    """Services an unfinished earlier rollback attempt meant to restart or start."""
+    if journal.get('status') not in ('rolling-back', 'rollback-failed'):
+        return set()
+    return {unit for attempt in journal.get('rollbacks', []) for unit in attempt.get('services', [])}
+
+
 def preflight(home, journal, desktop):
     """Work out a rollback without changing anything."""
     plan = Recovery()
+    intended = pending_services(journal)
     done = journal.get('done', [])
     numbers = list(done)
     # An interrupted or failed run may have finished part or all of the step it was on.
@@ -270,18 +279,19 @@ def preflight(home, journal, desktop):
         elif step['type'] == 'gsetting':
             _setting(desktop, step, plan)
         elif step['type'] == 'unit':
-            _unit(desktop, step, plan, number == in_flight, journal.get('status') in ('rolling-back', 'rollback-failed'))
+            _unit(desktop, step, plan, number == in_flight, step['unit'] in intended)
     return plan
 
 
-def restore(home, journal, desktop, automatic=False, keep_changed=False, progress=None):
+def restore(home, journal, desktop, automatic=False, keep_changed=False, progress=None, plan=None):
     """Undo a transaction: services stop first, then files and settings return, then services restart.
 
     Refuses (RollbackRefused) when something changed after installation, unless keep_changed
     leaves those changes in place; an automatic recovery after a failure also leaves them and
-    reports them as problems. progress(item) is called after each item is restored.
+    reports them as problems. progress(item) is called after each item is restored or each service
+    stopped or disabled. plan is a Recovery already worked out by preflight().
     """
-    plan = preflight(home, journal, desktop)
+    plan = plan or preflight(home, journal, desktop)
     if plan.problems and not (automatic or keep_changed):
         raise RollbackRefused(plan.problems)
     if keep_changed:
@@ -290,8 +300,12 @@ def restore(home, journal, desktop, automatic=False, keep_changed=False, progres
     for action in plan.units:                     # with their current unit files still in place
         if action['stop']:
             desktop.command('systemctl', '--user', 'stop', action['unit'], check=True)
+            plan.restored.append(f'stopped {action["unit"]}')
+            progress and progress(plan.restored[-1])
         if action['disable']:
             desktop.command('systemctl', '--user', 'disable', action['unit'], check=True)
+            plan.restored.append(f'disabled {action["unit"]}')
+            progress and progress(plan.restored[-1])
     for step in plan.paths:
         before = State.from_dict(step['before'])
         if before.kind == 'absent':
@@ -356,12 +370,13 @@ def rollback(home, folder, desktop=None, keep_changed=False):
     attempt = {'started': datetime.now(timezone.utc).isoformat(), 'restored': [], 'keep_changed': keep_changed}
     journal.setdefault('rollbacks', []).append(attempt)
     try:
-        # Refusals are decided before anything changes, and leave the journal as it was.
-        if not keep_changed:
-            problems = preflight(home, journal, desktop).problems
-            if problems:
-                journal['rollbacks'].pop()
-                raise RollbackRefused(problems)
+        # Decided before anything changes: a refusal leaves the journal as it was, and the services this
+        # attempt will bring back are recorded, so a retry restarts those and no service the user stopped.
+        plan = preflight(home, journal, desktop)
+        if plan.problems and not keep_changed:
+            journal['rollbacks'].pop()
+            raise RollbackRefused(plan.problems)
+        attempt['services'] = [a['unit'] for a in plan.units if a['restart'] or a['start']]
         journal['status'] = 'rolling-back'
         save()
 
@@ -369,7 +384,7 @@ def rollback(home, folder, desktop=None, keep_changed=False):
             attempt['restored'].append(item)
             save()
 
-        outcome = restore(home, journal, desktop, keep_changed=keep_changed, progress=progress)
+        outcome = restore(home, journal, desktop, keep_changed=keep_changed, progress=progress, plan=plan)
     except RollbackRefused:
         if journal.get('status') == 'rolling-back':     # something changed after the check; nothing was restored
             journal['status'] = previous

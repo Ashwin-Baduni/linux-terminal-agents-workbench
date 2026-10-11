@@ -57,7 +57,13 @@ Nothing is overwritten without a backup. The plan names every file before anythi
 - **`~/.codex/AGENTS.md`** becomes a link to the shared memory when you have none. If you already have one, it keeps your instructions and gains a short block that tells Codex to read the shared memory. `AGENTS.override.md` gets the same block, because Codex reads it first.
 - **`~/ai-memory`**: an existing memory is never touched. A new one starts with the rules and empty indexes.
 - **Symlinks:** a symlink where a file goes is replaced by the file, and the file it pointed to is left alone. A symlinked folder is followed only when it stays inside your home. The installer refuses one that leads elsewhere. The links it creates are worked out from where their folder really is, so they still work inside a symlinked `~/.codex` or `~/.config/yazi-sidebar`.
-- **Masked services:** a unit you masked (its file in `~/.config/systemd/user` links to `/dev/null`) keeps its mask. So does one masked for every user in `/etc/systemd/user` or `/run/systemd/user`, or one that systemd reports as masked. The installer installs no unit file for it, and does not enable or start it. It names the unit at the end.
+- **Masked services:** these keep their mask:
+  - a unit you masked, whose file in `~/.config/systemd/user` links to `/dev/null`;
+  - a unit masked only until logout (`systemctl --user mask --runtime`);
+  - a unit masked for every user in `/etc/systemd/user` or `/run/systemd/user`;
+  - any unit systemd reports as masked.
+
+  On a real installation the installer asks systemd before planning any file. For a masked unit it writes no unit file, so the mask can't be undone, and it does not enable or start the unit. It names the unit at the end.
 
 `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are honoured when they point inside your home. If you use either one, set it for the whole desktop session, not only in `~/.bashrc`. The workspace, its menus and its monitor service start outside your shell, and they would otherwise read the default folders. Put the variable in a file such as `~/.config/environment.d/agents.conf`, for example `CODEX_HOME=$HOME/.config/codex`, then log out and back in. The installer only points out a mismatch. It never changes the session environment itself.
 
@@ -108,7 +114,7 @@ If an installation fails, it undoes what it had done at once. That includes a st
 
 If an installation is killed partway, the next run also refuses to continue until you run `--rollback` on it. That rollback covers the step the installation was on, too.
 
-A rollback writes its own progress into the journal as it goes. If it stops partway, because a service fails to restart or the rollback is interrupted, the journal says so and lists what was already restored. The installer then refuses to install again until you run the same `--rollback` once more. That run continues from where the last one stopped, and it starts a service an earlier attempt left stopped.
+A rollback writes its own progress into the journal as it goes. If it stops partway, because a service fails to restart or the rollback is interrupted, the journal says so and lists what was already restored. The installer then refuses to install again until you run the same `--rollback` once more. That run continues from where the last one stopped. Before changing anything, each attempt records which services it intends to restart. A retry starts those if they ended up stopped, and leaves alone any service you stopped yourself. Services already stopped or disabled are listed among the restored items, so a partial report shows them too.
 
 ## Trying it without touching your setup
 

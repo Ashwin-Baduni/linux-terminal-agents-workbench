@@ -256,7 +256,18 @@ class Safety(Scratch):
             plan = build(load(), context, ['workspace'])
         self.assertNotIn('.config/systemd/user/workspace-monitor.service', {c.path for c in plan.changes})
         self.assertEqual(plan.masked, {'workspace-monitor.service'})
-        self.assertTrue(any('masked for every user' in note for note in plan.notes))
+        self.assertTrue(any(f'masked in {system}' in note for note in plan.notes), plan.notes)
+
+    def test_a_runtime_mask_file_is_not_overridden(self):
+        runtime = self.root / 'run-user'
+        (runtime / 'systemd/user').mkdir(parents=True)
+        (runtime / 'systemd/user/workspace-monitor.service').symlink_to(os.devnull)
+        context = Context(home=Home(self.home), values=resolve_values(self.home.resolve(), False), real=True,
+                          env={'XDG_RUNTIME_DIR': str(runtime)})
+        with mock.patch.object(plan_module, 'SYSTEM_UNIT_DIRS', ()):
+            plan = build(load(), context, ['workspace'])
+        self.assertNotIn('.config/systemd/user/workspace-monitor.service', {c.path for c in plan.changes})
+        self.assertEqual(plan.masked, {'workspace-monitor.service'})
 
     def test_rollback_refuses_a_folder_symlink_added_later(self):
         self.cli('--install', '--only', 'terminal')
@@ -846,6 +857,64 @@ class DesktopIntegration(Scratch):
         with mock.patch.dict(os.environ, {'CODEX_HOME': str(self.home / 'codex-elsewhere')}):
             out = self.run_install()
         self.assertIn('CODEX_HOME is set in this terminal but not for the whole desktop session', out)
+
+    def install_with_monitor_restart(self):
+        old = self.home / '.local/share/workspace/workspace.py'
+        old.parent.mkdir(parents=True)
+        old.write_text('# the previous workspace code\n')
+        self.units.write_text(json.dumps({'units': {'workspace-monitor.service': {'enabled': 'enabled', 'active': 'active'}}}))
+        self.run_install()
+        return old
+
+    def set_unit_state(self, unit, **values):
+        state = json.loads(self.units.read_text())
+        state['units'][unit].update(values)
+        self.units.write_text(json.dumps(state))
+
+    def test_a_first_rollback_leaves_a_service_you_stopped_stopped(self):
+        old = self.install_with_monitor_restart()
+        self.set_unit_state('workspace-monitor.service', active='inactive')     # you stopped it after installing
+        logged = len(json.loads(self.units.read_text())['log'])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop)
+        self.assertIn('workspace-monitor.service (stopped since installing; left stopped)', out.getvalue())
+        self.assertEqual(self.unit('workspace-monitor.service'), {'enabled': 'enabled', 'active': 'inactive'})
+        later = json.loads(self.units.read_text())['log'][logged:]
+        self.assertFalse([line for line in later if line.split()[-1] == 'workspace-monitor.service'
+                          and line.split()[0] in ('start', 'restart', 'try-restart')], later)
+        self.assertEqual(old.read_text(), '# the previous workspace code\n')
+
+    def test_a_retry_starts_only_the_services_the_rollback_meant_to(self):
+        self.install_with_monitor_restart()
+        self.set_unit_state('workspace-monitor.service', active='inactive')     # you stopped it after installing
+        state = json.loads(self.units.read_text())
+        state['fail'] = ['disable ai-memory-snapshot.timer']
+        self.units.write_text(json.dumps(state))
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(transaction.RollbackIncomplete) as stopped:
+            rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop)
+        self.assertEqual(stopped.exception.restored, ['stopped ai-memory-snapshot.timer'])
+        journal = json.loads((self.backups()[-1] / 'journal.json').read_text())
+        self.assertEqual(journal['rollbacks'][-1]['restored'], ['stopped ai-memory-snapshot.timer'])
+        self.assertEqual(journal['rollbacks'][-1]['services'], [])
+        state = json.loads(self.units.read_text())
+        state['fail'] = []
+        self.units.write_text(json.dumps(state))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop)
+        self.assertEqual(self.unit('workspace-monitor.service'), {'enabled': 'enabled', 'active': 'inactive'})
+        self.assertEqual(self.unit('ai-memory-snapshot.timer'), {'enabled': 'disabled', 'active': 'inactive'})
+
+    def test_a_runtime_mask_prevents_the_unit_file_and_its_activation(self):
+        self.units.write_text(json.dumps({'units': {'workspace-save.timer': {'enabled': 'masked-runtime',
+                                                                             'active': 'inactive'}}}))
+        out = self.run_install()
+        self.assertIn('workspace-save.timer is masked (systemd reports it as masked-runtime)', out)
+        self.assertFalse((self.home / '.config/systemd/user/workspace-save.timer').exists())
+        self.assertTrue((self.home / '.config/systemd/user/workspace-save.service').exists())
+        log = json.loads(self.units.read_text())['log']
+        self.assertFalse([line for line in log if 'workspace-save.timer' in line and not line.startswith('is-')], log)
+        self.assertEqual(self.unit('workspace-save.timer'), {'enabled': 'masked-runtime', 'active': 'inactive'})
+        self.assertIn('nothing was changed', self.run_install())
 
     def test_a_service_changed_later_is_not_overwritten(self):
         self.run_install()

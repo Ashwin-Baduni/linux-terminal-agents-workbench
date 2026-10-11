@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import pwd
 import re
 import shutil
@@ -12,7 +12,7 @@ from . import packages, preflight
 from .desktop import Desktop, extensions_with_schema, refresh_caches
 from .fsops import Home, Unsafe
 from .manifest import load
-from .plan import Context, PlanError, build, describe, masked_note
+from .plan import UNIT_FOLDER, Context, PlanError, build, describe, masked_note
 from .stage import SAFE_HOME
 from .transaction import (STATE_DIR, RollbackRefused, Transaction, install_lock, latest, load_journal,
                           rollback as undo, unfinished)
@@ -111,10 +111,25 @@ class Run:
             return []
         return [agent for agent in self.agents if not packages.find(agent.name, self.home.root, self.options.real)]
 
+    def masked_units(self):
+        """Units the files would install that systemd reports as masked (also runtime masks), asked
+        read-only on a real installation or when activating; a staging folder has no systemd to ask."""
+        if not (self.desktop or self.options.real):
+            return {}
+        desktop = self.desktop or Desktop()
+        found = {}
+        for entry in self.manifest.select(self.chosen):
+            if entry.target.startswith(UNIT_FOLDER) and entry.source:
+                name = PurePosixPath(entry.target).name
+                state = desktop.unit_state(name)['enabled']
+                if state.startswith('masked'):
+                    found[name] = state
+        return found
+
     def plan(self):
         values = resolve_values(self.home.root, self.options.real)
         context = Context(home=self.home, values=values, real=self.options.real, env=dict(os.environ),
-                          agent_policy=self.options.agent_policy)
+                          agent_policy=self.options.agent_policy, masked=self.masked_units())
         try:
             return build(self.manifest, context, self.chosen)
         except (PlanError, Unsafe) as error:
