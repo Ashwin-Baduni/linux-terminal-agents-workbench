@@ -1,0 +1,25 @@
+# AMOLED Black: pure #000000 background so OLED pixels switch off, white text,
+# grey highlights matching the Firefox "Black" theme. Accent colours are
+# Catppuccin Mocha, which stay soft and readable on true black.
+background = #000000
+foreground = #ffffff
+cursor-color = #ffffff
+cursor-text = #000000
+selection-background = #3f3f3f
+selection-foreground = #ffffff
+palette = 0=#2f2f2f
+palette = 1=#f38ba8
+palette = 2=#a6e3a1
+palette = 3=#f9e2af
+palette = 4=#89b4fa
+palette = 5=#cba6f7
+palette = 6=#94e2d5
+palette = 7=#d0d0d0
+palette = 8=#808080
+palette = 9=#f7a6bc
+palette = 10=#bdebb9
+palette = 11=#fbeac4
+palette = 12=#a6c7fb
+palette = 13=#d9bff9
+palette = 14=#afeae0
+palette = 15=#ffffff

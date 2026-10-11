@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ghostty (open here)
+Comment=Used by "Open in Terminal" and Ctrl+Alt+T: opens a Ghostty window in the requested folder
+Exec=/usr/bin/ghostty +new-window
+TryExec=/usr/bin/ghostty
+Icon=com.mitchellh.ghostty
+Terminal=false
+NoDisplay=true
+Categories=System;TerminalEmulator;
+X-TerminalArgExec=-e
+X-TerminalArgDir=--working-directory=

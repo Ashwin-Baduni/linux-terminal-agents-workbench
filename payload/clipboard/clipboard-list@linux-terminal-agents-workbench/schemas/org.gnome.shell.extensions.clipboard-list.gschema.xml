@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.clipboard-list" path="/org/gnome/shell/extensions/clipboard-list/">
+    <key name="open" type="as">
+      <default>['&lt;Super&gt;v']</default>
+      <summary>Shortcut that opens the clipboard list</summary>
+    </key>
+  </schema>
+</schemalist>

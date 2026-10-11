@@ -1,0 +1,8 @@
+{
+  "uuid": "clipboard-list@linux-terminal-agents-workbench",
+  "name": "Clipboard list",
+  "description": "Super+V shows what you copied recently. Click one, or press Enter, to copy it again. The list is forgotten when you log out.",
+  "shell-version": ["50"],
+  "settings-schema": "org.gnome.shell.extensions.clipboard-list",
+  "version": 1
+}

@@ -1,0 +1,19 @@
+# yazi config. Only changes from the defaults are listed here.
+# Defaults: https://yazi-rs.github.io/docs/configuration/yazi
+
+[mgr]
+sort_dir_first = true
+# Show each file's last-modified time, so files Claude just wrote stand out.
+linemode = "mtime"
+
+[opener]
+glow = [
+	{ run = "glow -p %s1", desc = "Read with glow", block = true, for = "unix" },
+]
+
+[open]
+prepend_rules = [
+	# Markdown opens formatted in glow; HTML opens in the browser.
+	{ url = "*.md", use = [ "glow", "edit", "reveal" ] },
+	{ url = "*.html", use = [ "open", "edit", "reveal" ] },
+]

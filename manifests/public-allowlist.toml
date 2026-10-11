@@ -1,0 +1,17 @@
+# Reviewed exceptions for scripts/check-public.py. Each entry allows one exact value in
+# matching files. Keep upstream notices and metadata intact rather than deleting them.
+
+[[allow]]
+path = "vendor/bash-preexec/bash-preexec.sh"
+value = "ryan@bashhub.com"
+reason = "upstream author contact in the bash-preexec header"
+
+[[allow]]
+path = "payload/terminal/themes/catppuccin-mocha-black.tmTheme"
+value = "627ce890-fabb-4d39-9819-7be71f4bdca7"
+reason = "Catppuccin Mocha theme identifier from the upstream theme"
+
+[[allow]]
+path = "vendor/yazi-plugins/git.yazi/README.md"
+value = "34976be9-a871-4ffe-9d5a-c4cdd0bf4576"
+reason = "upstream screenshot link in the Yazi git plugin README"

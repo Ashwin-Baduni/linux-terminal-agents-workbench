@@ -1,0 +1,12 @@
+#!/bin/bash
+# The Directory sidebar for `work`: the narrow file browser. Its Close button
+# closes the sidebar.
+# TMUX is hidden from yazi so it doesn't try to enable image passthrough
+# (the sidebar has no previews). Otherwise its startup queries are answered by
+# Ghostty into whichever pane has focus, and show up as junk in Agent 1.
+# Yazi's snap puts it in /snap/bin, which a desktop session's PATH may lack.
+yazi=/snap/bin/yazi
+[ -x "$yazi" ] || yazi="$(command -v yazi)" || { echo "Install Yazi first." >&2; exit 1; }
+workspace_yazi_id="$(date +%s%N)"
+exec env -u TMUX WORKSPACE_PANE="$TMUX_PANE" WORKSPACE_YAZI_ID="$workspace_yazi_id" \
+    YAZI_CONFIG_HOME="$HOME/.config/yazi-sidebar" "$yazi" --client-id "$workspace_yazi_id" "$@"

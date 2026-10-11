@@ -1,0 +1,11 @@
+{
+  "add": [
+    [
+      "org.gnome.shell",
+      "favorite-apps",
+      [
+        "workspace.desktop"
+      ]
+    ]
+  ]
+}

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Open a project, or the recent/favourite/parked workspace picker.
+exec "$HOME/.local/bin/workspace-control" open "$@"

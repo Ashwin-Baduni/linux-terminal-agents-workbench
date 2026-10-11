@@ -1,0 +1,27 @@
+{
+  "add": [
+    [
+      "org.gnome.shell",
+      "enabled-extensions",
+      [
+        "clipboard-list@linux-terminal-agents-workbench"
+      ]
+    ],
+    [
+      "org.gnome.shell.keybindings",
+      "toggle-message-tray",
+      [
+        "<Super>m"
+      ]
+    ]
+  ],
+  "remove": [
+    [
+      "org.gnome.shell.keybindings",
+      "toggle-message-tray",
+      [
+        "<Super>v"
+      ]
+    ]
+  ]
+}

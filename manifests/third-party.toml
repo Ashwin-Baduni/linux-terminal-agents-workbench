@@ -1,0 +1,60 @@
+# Material in this repository that comes from other projects. THIRD_PARTY_NOTICES.md
+# is the readable version; tests/repo/test_repo.py checks that every path and licence exists.
+#
+#   files     repository paths (globs) holding the material
+#   licence   the upstream licence text shipped here
+#   revision  the upstream version or commit the copy matches
+#   modified  what this repository changed, if anything
+
+format = 1
+
+[[material]]
+name = "tmux-resurrect"
+upstream = "https://github.com/tmux-plugins/tmux-resurrect"
+revision = "cff343cf9e81983d3da0c8562b01616f12e8d548"
+spdx = "MIT"
+files = ["vendor/tmux-resurrect/*"]
+licence = "vendor/tmux-resurrect/LICENSE.md"
+modified = "no; only the runtime scripts and the licence are included (docs, tests and media left out)"
+
+[[material]]
+name = "bash-preexec"
+upstream = "https://github.com/rcaloras/bash-preexec"
+revision = "0.7.0"
+spdx = "MIT"
+files = ["vendor/bash-preexec/bash-preexec.sh"]
+licence = "licenses/bash-preexec.LICENSE"
+modified = "no"
+
+[[material]]
+name = "Yazi git plugin"
+upstream = "https://github.com/yazi-rs/plugins"
+revision = "33dde28"
+spdx = "MIT"
+files = ["vendor/yazi-plugins/git.yazi/*"]
+licence = "licenses/yazi-plugins.LICENSE"
+modified = "no; installed read-only as ya pkg does"
+
+[[material]]
+name = "Catppuccin Mocha themes for bat/Yazi previews (TextMate) and glow (glamour)"
+upstream = "https://github.com/catppuccin"
+spdx = "MIT"
+files = ["payload/terminal/themes/catppuccin-mocha-black.tmTheme", "payload/terminal/glow/catppuccin-amoled.json"]
+licence = "licenses/catppuccin.LICENSE"
+modified = "yes; backgrounds changed to pure black (#000000) and near-black greys"
+
+[[material]]
+name = "Catppuccin Mocha palette in the original AMOLED themes"
+upstream = "https://github.com/catppuccin/catppuccin"
+spdx = "MIT"
+files = ["payload/terminal/ghostty/themes/amoled-black", "payload/workspace/tmux/workspace.conf"]
+licence = "licenses/catppuccin.LICENSE"
+modified = "colour values only; the themes themselves are original to this project"
+
+[[material]]
+name = "Starship Nerd Font Symbols preset"
+upstream = "https://github.com/starship/starship"
+spdx = "ISC"
+files = ["payload/terminal/starship.toml"]
+licence = "licenses/starship.LICENSE"
+modified = "no; identical to the output of `starship preset nerd-font-symbols`"

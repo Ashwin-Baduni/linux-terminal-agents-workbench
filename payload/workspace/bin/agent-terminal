@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Give interactive agents in ordinary Ghostty tabs a mouse menu.
+
+Existing tmux panes and noninteractive commands invoke the real agent directly.
+Each ordinary-tab agent gets a private, temporary tmux server; no parked session
+or project-picker entry is created. Exiting returns to the original shell.
+"""
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+
+def interactive(agent, args):
+    if os.environ.get('TMUX') or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    if os.environ.get('TERM_PROGRAM') != 'ghostty':
+        return False
+    if any(arg in ('--help', '-h', '--version', '-V') for arg in args):
+        return False
+    if agent == 'claude':
+        if any(arg in ('--print', '--output-format', '--input-format') or
+               (arg.startswith('-') and not arg.startswith('--') and 'p' in arg[1:]) for arg in args):
+            return False
+        commands = {'mcp', 'plugin', 'install', 'update', 'doctor', 'auth',
+                    'agents', 'setup-token', 'remote-control'}
+        return not (args and args[0] in commands)
+    commands = {'exec', 'e', 'review', 'login', 'logout', 'mcp', 'mcp-server',
+                'app-server', 'app', 'completion', 'sandbox', 'debug', 'apply',
+                'cloud', 'features', 'help'}
+    return not any(arg in commands for arg in args)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--child':
+        code = subprocess.call(sys.argv[3:])
+        Path(sys.argv[2]).write_text(str(code if code >= 0 else 128 - code))
+        return code if code >= 0 else 128 - code
+    if len(sys.argv) < 2 or sys.argv[1] not in ('claude', 'codex'):
+        raise SystemExit('Usage: agent-terminal {claude|codex} [agent arguments...]')
+    agent, args = sys.argv[1], sys.argv[2:]
+    binary = shutil.which(agent)
+    if not binary:
+        raise SystemExit('Install ' + agent + ' and sign in first.')
+    if not interactive(agent, args):
+        os.execv(binary, [binary, *args])
+    runtime = os.environ.get('XDG_RUNTIME_DIR')
+    with tempfile.TemporaryDirectory(prefix='agent-terminal-', dir=runtime) as temporary:
+        socket = str(Path(temporary) / 'tmux.sock')
+        status = Path(temporary) / 'exit-status'
+        config = Path.home() / '.config/tmux/agent-terminal.conf'
+        command = [sys.executable, str(Path(__file__).resolve()), '--child', str(status), binary, *args]
+        process = None
+        def interrupted(signum, frame):
+            raise SystemExit(128 + signum)
+        for signum in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(signum, interrupted)
+        try:
+            process = subprocess.Popen(['tmux', '-S', socket, '-f', str(config),
+                                        'new-session', '-s', 'agent', '-c', os.getcwd(),
+                                        shlex.join(command)])
+            code = process.wait()
+            return int(status.read_text()) if status.exists() else code
+        finally:
+            subprocess.run(['tmux', '-S', socket, 'kill-server'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if process is not None and process.poll() is None:
+                process.wait(timeout=5)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

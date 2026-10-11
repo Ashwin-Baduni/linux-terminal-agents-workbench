@@ -1,0 +1,9 @@
+[Unit]
+Description=Save workspace layouts every ten minutes
+
+[Timer]
+OnStartupSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+{
+  "": {
+    "suppress_unstable_features_warning": true
+  },
+  "tui": {
+    "copy_on_select": "always",
+    "right_click_paste": "off"
+  }
+}

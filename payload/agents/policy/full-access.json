@@ -1,0 +1,18 @@
+{
+  "claude": {
+    "permissions": {
+      "defaultMode": "bypassPermissions"
+    },
+    "skipDangerousModePermissionPrompt": true
+  },
+  "codex": {
+    "": {
+      "approval_policy": "never",
+      "sandbox_mode": "danger-full-access",
+      "web_search": "live"
+    },
+    "notice": {
+      "hide_full_access_warning": true
+    }
+  }
+}

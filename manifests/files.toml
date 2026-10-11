@@ -1,0 +1,427 @@
+# Every file this repository installs, and where it goes.
+#
+# Paths:
+#   source  repository path
+#   target  destination, relative to the target home
+#   live    where scripts/import-live.py reads the file on a machine that already
+#           runs the setup (relative to that home; defaults to target; false = the
+#           repository copy is the only source)
+#
+# Kinds (default "file"):
+#   file    install the source at target, backing up whatever was there
+#   seed    install only when target does not exist yet; never overwrite
+#   link    create a symlink at target pointing to `link` (always relative)
+#   dir     create the directory target
+#   merge   combine source into an existing target with `strategy`, keeping
+#           everything else in that file (implemented by the installer)
+#
+# Other fields:
+#   component  which component installs it (see components.toml)
+#   mode       octal permission bits; default 644
+#   render     replace @PLACEHOLDER@ tokens (see [placeholders]) at install time
+#   sanitize   [[old, new], ...] replacements import-live applies after turning the
+#              live home path into @HOME@. Never list private names here: this file
+#              is public. Files the repository changed on purpose simply show up as
+#              differences in import-live until the live machine is reinstalled.
+#
+# [[tree]] maps a whole vendored directory; `include` lists the files (globs)
+# shipped from it, and `mode` overrides the permission bits of every file.
+
+format = 1
+
+[placeholders]
+HOME = "absolute path of the target home"
+CLAUDE_BIN = "the target user's claude executable"
+
+# --- terminal ----------------------------------------------------------------
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/ghostty/config"
+target = ".config/ghostty/config"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/ghostty/themes/amoled-black"
+target = ".config/ghostty/themes/amoled-black"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/claude/themes/amoled.json"
+target = ".claude/themes/amoled.json"
+
+[[file]]
+component = "terminal"
+kind = "merge"
+strategy = "bash-block"
+source = "payload/terminal/shell/bashrc.sh"
+target = ".bashrc"
+live = false
+
+[[file]]
+component = "terminal"
+kind = "merge"
+strategy = "inputrc"
+source = "payload/terminal/shell/inputrc"
+target = ".inputrc"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/starship.toml"
+target = ".config/starship.toml"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/atuin/config.toml"
+target = ".config/atuin/config.toml"
+mode = "600"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/themes/catppuccin-mocha-black.tmTheme"
+target = ".config/bat/themes/Catppuccin Mocha.tmTheme"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/themes/catppuccin-mocha-black.tmTheme"
+target = ".config/yazi/Catppuccin-Mocha.tmTheme"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/glow/glow.yml"
+target = ".config/glow/glow.yml"
+render = true
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/glow/catppuccin-amoled.json"
+target = ".config/glow/catppuccin-amoled.json"
+
+[[file]]
+component = "terminal"
+kind = "merge"
+strategy = "json"
+source = "payload/terminal/micro/settings.json"
+target = ".config/micro/settings.json"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/micro/colorschemes/amoled.micro"
+target = ".config/micro/colorschemes/amoled.micro"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/yazi/init.lua"
+target = ".config/yazi/init.lua"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/yazi/yazi.toml"
+target = ".config/yazi/yazi.toml"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/yazi/theme.toml"
+target = ".config/yazi/theme.toml"
+render = true
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/bin/md-view"
+target = ".local/bin/md-view"
+mode = "755"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/applications/ghostty-here.desktop"
+target = ".local/share/applications/ghostty-here.desktop"
+
+[[file]]
+component = "terminal"
+source = "payload/terminal/applications/md-view.desktop"
+target = ".local/share/applications/md-view.desktop"
+render = true
+
+[[file]]
+component = "terminal"
+kind = "merge"
+strategy = "lines-first"
+source = "payload/terminal/ubuntu-xdg-terminals.list"
+target = ".config/ubuntu-xdg-terminals.list"
+
+[[file]]
+component = "terminal"
+kind = "merge"
+strategy = "mimeapps"
+source = "payload/terminal/mime-defaults.json"
+target = ".config/mimeapps.list"
+live = false
+
+[[file]]
+component = "terminal"
+source = "vendor/bash-preexec/bash-preexec.sh"
+target = ".local/share/workspace/bash-preexec.sh"
+
+[[file]]
+component = "terminal"
+source = "licenses/bash-preexec.LICENSE"
+target = ".local/share/workspace/licenses/bash-preexec.LICENSE"
+
+[[file]]
+component = "terminal"
+source = "licenses/catppuccin.LICENSE"
+target = ".local/share/workspace/licenses/catppuccin.LICENSE"
+
+[[file]]
+component = "terminal"
+source = "licenses/starship.LICENSE"
+target = ".local/share/workspace/licenses/starship.LICENSE"
+live = false
+
+# --- workspace ---------------------------------------------------------------
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/bin/work"
+target = ".local/bin/work"
+mode = "755"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/bin/workspace-control"
+target = ".local/bin/workspace-control"
+mode = "755"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/bin/work-files"
+target = ".local/bin/work-files"
+mode = "755"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/bin/open-path"
+target = ".local/bin/open-path"
+mode = "755"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/bin/agent-terminal"
+target = ".local/bin/agent-terminal"
+mode = "755"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/workspace.py"
+target = ".local/share/workspace/workspace.py"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/tmux/workspace.conf"
+target = ".config/tmux/workspace.conf"
+render = true
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/tmux/agent-terminal.conf"
+target = ".config/tmux/agent-terminal.conf"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/yazi-sidebar/init.lua"
+target = ".config/yazi-sidebar/init.lua"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/yazi-sidebar/yazi.toml"
+target = ".config/yazi-sidebar/yazi.toml"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/yazi-sidebar/package.toml"
+target = ".config/yazi-sidebar/package.toml"
+
+[[file]]
+component = "workspace"
+kind = "link"
+target = ".config/yazi-sidebar/theme.toml"
+link = "../yazi/theme.toml"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/yazi-sidebar/plugins/workspace.yazi/main.lua"
+target = ".config/yazi-sidebar/plugins/workspace.yazi/main.lua"
+
+[[tree]]
+component = "workspace"
+source = "vendor/yazi-plugins/git.yazi"
+target = ".config/yazi-sidebar/plugins/git.yazi"
+include = ["LICENSE", "README.md", "main.lua", "types.lua"]
+mode = "444"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/systemd/workspace-monitor.service"
+target = ".config/systemd/user/workspace-monitor.service"
+sanitize = [["@HOME@/", "%h/"]]
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/systemd/workspace-save.service"
+target = ".config/systemd/user/workspace-save.service"
+sanitize = [["@HOME@/", "%h/"]]
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/systemd/workspace-save.timer"
+target = ".config/systemd/user/workspace-save.timer"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/applications/workspace.desktop"
+target = ".local/share/applications/workspace.desktop"
+render = true
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/nautilus/Open Workspace Here"
+target = ".local/share/nautilus/scripts/Open Workspace Here"
+mode = "755"
+
+[[file]]
+component = "workspace"
+source = "payload/workspace/icons/work-layout.svg"
+target = ".local/share/icons/hicolor/scalable/apps/work-layout.svg"
+
+[[tree]]
+component = "workspace"
+source = "vendor/tmux-resurrect"
+target = ".local/share/workspace/tmux-resurrect"
+include = ["LICENSE.md", "resurrect.tmux", "scripts/*", "save_command_strategies/*", "strategies/*"]
+
+[[file]]
+component = "workspace"
+source = "licenses/yazi-plugins.LICENSE"
+target = ".local/share/workspace/licenses/yazi-plugins.LICENSE"
+
+# --- agents ------------------------------------------------------------------
+
+[[file]]
+component = "agents"
+source = "payload/agents/bin/agent-pair"
+target = ".local/bin/agent-pair"
+mode = "755"
+
+[[file]]
+component = "agents"
+kind = "merge"
+strategy = "claude-settings"
+source = "payload/agents/claude-settings.json"
+render = true
+target = ".claude/settings.json"
+live = false
+
+[[file]]
+component = "agents"
+kind = "merge"
+strategy = "codex-config"
+source = "payload/agents/codex-config.json"
+target = ".codex/config.toml"
+live = false
+
+# Claude Code can register this handler itself; never replace an existing one.
+[[file]]
+component = "agents"
+kind = "seed"
+source = "payload/agents/applications/claude-code-url-handler.desktop"
+target = ".local/share/applications/claude-code-url-handler.desktop"
+render = true
+sanitize = [["\"@HOME@/.local/bin/claude\"", "\"@CLAUDE_BIN@\""]]
+
+[[file]]
+component = "agents"
+kind = "merge"
+strategy = "mimeapps"
+source = "payload/agents/mime-defaults.json"
+target = ".config/mimeapps.list"
+live = false
+
+# --- memory ------------------------------------------------------------------
+
+[[file]]
+component = "memory"
+source = "payload/memory/bin/ai-memory"
+target = ".local/bin/ai-memory"
+mode = "755"
+
+[[file]]
+component = "memory"
+source = "payload/memory/systemd/ai-memory-snapshot.service"
+target = ".config/systemd/user/ai-memory-snapshot.service"
+
+[[file]]
+component = "memory"
+source = "payload/memory/systemd/ai-memory-snapshot.timer"
+target = ".config/systemd/user/ai-memory-snapshot.timer"
+
+# The shared memory starts empty. An existing ~/ai-memory is never replaced.
+[[file]]
+component = "memory"
+kind = "seed"
+source = "templates/memory/MEMORY.md"
+target = "ai-memory/MEMORY.md"
+live = false
+
+[[file]]
+component = "memory"
+kind = "dir"
+target = "ai-memory/projects"
+
+[[file]]
+component = "memory"
+kind = "merge"
+strategy = "claude-import"
+source = "templates/memory/CLAUDE.md"
+target = ".claude/CLAUDE.md"
+live = false
+
+# Codex reads the same rules through its global AGENTS.md.
+[[file]]
+component = "memory"
+kind = "link"
+target = ".codex/AGENTS.md"
+link = "../ai-memory/MEMORY.md"
+
+[[file]]
+component = "memory"
+kind = "merge"
+strategy = "git-ignore"
+source = "payload/memory/git-ignore"
+target = ".config/git/ignore"
+live = false
+
+# --- clipboard ---------------------------------------------------------------
+
+[[file]]
+component = "clipboard"
+source = "payload/clipboard/clipboard-list@linux-terminal-agents-workbench/extension.js"
+target = ".local/share/gnome-shell/extensions/clipboard-list@linux-terminal-agents-workbench/extension.js"
+live = false
+
+[[file]]
+component = "clipboard"
+source = "payload/clipboard/clipboard-list@linux-terminal-agents-workbench/metadata.json"
+target = ".local/share/gnome-shell/extensions/clipboard-list@linux-terminal-agents-workbench/metadata.json"
+live = false
+
+[[file]]
+component = "clipboard"
+source = "payload/clipboard/clipboard-list@linux-terminal-agents-workbench/stylesheet.css"
+target = ".local/share/gnome-shell/extensions/clipboard-list@linux-terminal-agents-workbench/stylesheet.css"
+live = false
+
+[[file]]
+component = "clipboard"
+source = "payload/clipboard/clipboard-list@linux-terminal-agents-workbench/schemas/org.gnome.shell.extensions.clipboard-list.gschema.xml"
+target = ".local/share/gnome-shell/extensions/clipboard-list@linux-terminal-agents-workbench/schemas/org.gnome.shell.extensions.clipboard-list.gschema.xml"
+live = false

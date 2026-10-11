@@ -1,0 +1,6 @@
+[Unit]
+Description=Commit changes in ~/ai-memory to its local git history
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/ai-memory snapshot

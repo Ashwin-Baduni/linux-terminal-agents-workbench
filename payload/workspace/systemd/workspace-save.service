@@ -1,0 +1,6 @@
+[Unit]
+Description=Save workspace layouts for recovery
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/workspace-control snapshot

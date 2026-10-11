@@ -1,0 +1,24 @@
+{
+  "set": [
+    [
+      "org.gnome.desktop.default-applications.terminal",
+      "exec",
+      "'xdg-terminal-exec'"
+    ],
+    [
+      "org.gnome.desktop.default-applications.terminal",
+      "exec-arg",
+      "'--'"
+    ]
+  ],
+  "add": [
+    [
+      "org.gnome.settings-daemon.plugins.media-keys",
+      "terminal",
+      [
+        "<Primary><Alt>t",
+        "<Super>t"
+      ]
+    ]
+  ]
+}

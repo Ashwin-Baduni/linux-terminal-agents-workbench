@@ -1,0 +1,1847 @@
+#!/usr/bin/env python3
+"""Pair two agents in one tmux window: an orchestrator directs and checks, a coder edits.
+
+Either side may be Claude or Codex with any model, so Astra + Luna or Fable + Opus
+pair as well as mixed vendors. Each agent's own turn-end hook drops its final reply
+into the pair folder; the Relay pane pastes it into the other agent's terminal.
+Nothing is screen-scraped and the human can type into either agent at any time.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import difflib
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+HOME = Path.home()
+# Codex remembers hook approval per command string, so the hook command never varies.
+BIN = Path(os.environ.get('AGENT_PAIR_BIN', HOME / '.local/bin/agent-pair'))
+HOOK = shlex.join([str(BIN), 'hook'])
+STATE = Path(os.environ.get('AGENT_PAIR_STATE', HOME / '.local/state/agent-pair'))
+SOCKET = os.environ.get('WORKSPACE_TMUX_SOCKET', 'workspace')
+CONFIG = HOME / '.config/tmux/workspace.conf'
+SEP = '\x1f'
+ROLES = ('orchestrator', 'coder')
+# Every relayed message opens with a header naming its sender and receiver, such as
+# "[orchestrator → coder]". The arrow travels intact through Claude Code and Codex (tested both
+# ways); "@" is avoided because both open a file picker on it.
+RELAYED = re.compile(r'\[(?:orchestrator|coder|relay) → (?:orchestrator|coder)(?: · [^\]\n]*)?\]')
+
+
+# Agents copy the headers they see and sometimes open a reply with one (seen live: an orchestrator wrote
+# "[relay → coder]"); the relay adds the right header itself, so a copied one at the start is dropped.
+COPIED_HEADER = re.compile(r'\A\s*[*_`#>]*\s*\[(?:orchestrator|coder|relay) → (?:orchestrator|coder)(?: · [^\]\n]*)?\][*_`]*[ \t]*\n*')
+
+
+def header(sender, receiver, extra=''):
+    return f'[{sender} → {receiver}' + (f' · {extra}' if extra else '') + ']'
+
+
+def words(text):
+    """The text's words only: Claude Code may wrap a paste in <pasted_content> tags, and spacing may change."""
+    return ' '.join(re.sub(r'[^\w→]+', ' ', re.sub(r'</?pasted_content[^>]*>', ' ', text)).split())
+
+
+def signature(text):
+    """A message's first words, to tell the turn it starts from any other turn."""
+    return words(text)[:160]
+
+
+# Messages an agent's own tool sends itself, such as Claude Code's notice that a background command
+# finished. They continue the agent's work; they are not the human talking.
+AUTOMATIC = re.compile(r'\s*<(task-notification|system-reminder|local-command-stdout|bash-notification)\b')
+LONG = 20000  # Longer messages travel as a file the receiver is told to read.
+SIMILAR = 0.9  # Two messages at least this alike count as a repeat.
+LOOP_REPEATS = 2  # The same instruction and the same report twice more in a row: a loop.
+QUIET_ROUNDS = int(os.environ.get('AGENT_PAIR_QUIET_ROUNDS', 10))  # Reports in a row that changed no files.
+REMINDER_EVERY = int(os.environ.get('AGENT_PAIR_REMINDER_EVERY', 20))  # Reports between quiet PAIR-DONE reminders.
+ENDED_SECONDS = int(os.environ.get('AGENT_PAIR_ENDED_SECONDS', 300))  # Idle screen, no report: the turn ended unseen.
+STUCK_SECONDS = int(os.environ.get('AGENT_PAIR_STUCK_SECONDS', 1800))  # A busy screen that has not changed this long.
+# A turn that stopped on an API error is tried again after these waits. A usage limit keeps being tried
+# hourly until it resets; other errors pause the pair once the waits run out, and some pause at once.
+RETRY_WAITS = {'rate_limit': (300, 900, 1800, 3600), 'transient': (60, 180, 600), 'permanent': ()}
+RETRY_SCALE = float(os.environ.get('AGENT_PAIR_RETRY_SCALE', 1))  # Tests shorten the waits.
+# Claude Code's StopFailure names and Codex's codexErrorInfo names.
+RATE_LIMITS = {'rate_limit', 'usageLimitExceeded', 'rateLimitExceeded'}
+PERMANENT = {'authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error',
+             'invalid_request', 'model_not_found', 'cloud_credential_error', 'unauthorized', 'badRequest',
+             'contextWindowExceeded', 'sessionBudgetExceeded', 'cyberPolicy', 'misalignmentPolicyViolation',
+             'sandboxError', 'threadRollbackFailed', 'tooManyDenials'}
+EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+CLAUDE_MODELS = [('claude-fable-5-1', 'Fable 5.1'), ('claude-opus-5-5', 'Opus 5.5'),
+                 ('claude-sonnet-5-5', 'Sonnet 5.5'), ('claude-haiku-5-5', 'Haiku 5.5')]
+
+# Everything the agents are ever told explains the relay, not how to work: the human's own
+# instructions (often an overnight script) decide that. The one rule beyond the mechanics is
+# PAIR-DONE, because in a relay an agent cannot stop by going quiet: every reply is forwarded.
+BRIEFS = {
+    'orchestrator': """A relay connects you with a coding agent ({other}); you both work in {folder}.
+You are the orchestrator: you plan and review the work, and the coder carries it out. You may also edit files yourself when that is quicker.
+- What you write at the end of each turn is sent to the coder. Its reply comes back to you headed [coder → orchestrator].
+- Notes headed [relay → orchestrator] come from the relay itself. Messages without such a header come directly from the human. They are not sent on.
+- The relay keeps going until you end a message with PAIR-DONE on its own line.""",
+    'coder': """A relay connects you with an orchestrating agent ({other}); you both work in {folder}.
+You are the coder: the orchestrator gives you the work.
+- Instructions arrive headed [orchestrator → coder]. Do the work, then end your turn with a short report of what you changed and how you checked it. The report goes back to the orchestrator.
+- Notes headed [relay → coder] come from the relay itself. Messages without such a header come directly from the human. Answer them directly; those answers are not sent on.""",
+}
+HANDSHAKE = header('relay', 'coder', 'setup') + ' Reply READY. Instructions come next.'
+NEW_ORCHESTRATOR = header('relay', 'orchestrator', 'setup') + ' Reply READY. The task comes next.'
+# Agents already running in a window get the brief as their first message; the token finds a joined Codex's conversation.
+JOINED = '[relay → {role} · setup · {token}]\n\n'
+SETUP_END = {'orchestrator': '\n\nReply READY. The task comes next.',
+             'orchestrator-task': '\n\nThe task: {task}',
+             'coder': '\n\nReply READY. Instructions come next.'}
+HELD = '\n\n---\nWhile the coder was working, you also wrote this. It was not sent to the coder:\n\n'
+REMINDER = '(Relay reminder: PAIR-DONE ends the relay when needed.)'
+LOOP_NOTE = ('(Relay note: the last few messages between you and the coder look almost the same. '
+             'If the work is complete, end with PAIR-DONE; otherwise try a different approach.)')
+QUIET_NOTE = ('(Relay note: the last {count} reports changed no files. If that is intended, carry on; '
+              'if the work is complete, end with PAIR-DONE.)')
+SKIP_NOTE = "The coder's last turn ended without a report. Decide what to send next."
+# Notes for an agent whose turn stalled. A stuck one is stopped with Esc first.
+STUCK_NOTE = {
+    'coder': ('(Relay note: nothing changed on your screen for {minutes}, so your last step was stopped. If a command '
+              "hung, rerun it with a timeout or in the background and carry on; if you can't, report what is "
+              'blocking you to the orchestrator.)'),
+    'orchestrator': ('(Relay note: nothing changed on your screen for {minutes}, so your last step was stopped. '
+                     'If a command hung, rerun it with a timeout or in the background and carry on.)'),
+}
+ENDED_NOTE = {
+    'coder': '(Relay note: your last turn ended without a report. Carry on where you left off, then report to the orchestrator.)',
+    'orchestrator': '(Relay note: your last turn ended without a message for the coder. Carry on where you left off.)',
+}
+TWICE_NOTE = '(Relay note: the coder got stuck twice on this step. Decide what to send next.)'
+RETRY_NOTE = {
+    'coder': '(Relay note: your last turn stopped on an error ({error}). Carry on where you left off, then report to the orchestrator.)',
+    'orchestrator': '(Relay note: your last turn stopped on an error ({error}). Carry on where you left off.)',
+}
+CLEARED_NOTE = "(Relay note: the coder's conversation was cleared, so it lost the step it was on. Decide what to send next.)"
+RESUMED_NOTE = '(Relay note: the relay is running again. Carry on; your next message goes to the coder.)'
+# An agent that joined got its brief as a message, which compacting its conversation may summarise away.
+REMIND = {
+    'orchestrator': ('(Relay reminder: you are the orchestrator. What you write at the end of each turn goes to the coder, '
+                     'and its replies come back headed [coder → orchestrator]. End with PAIR-DONE on its own line when the '
+                     'work is complete.)'),
+    'coder': ('(Relay reminder: you are the coder. Instructions arrive headed [orchestrator → coder]; end each turn with a '
+              'short report of what you changed and how you checked it, which goes back to the orchestrator.)'),
+}
+RELAY_LINES = 3  # The bottom strip: the latest exchanges, one line each; scroll it for more.
+# The Workspace palette (shared with the pane labels in workspace.conf and the window title), all
+# bold on the pure-black terminal. A colour always means one thing. State: working blue, finished
+# green, needs you red, ready grey. Who: orchestrator purple, coder light coral, you rose.
+# Everything else is white; the message being passed on is grey.
+WHITE, GREY = (228, 228, 228), (150, 152, 168)
+ROLE_COLOURS = {'orchestrator': (203, 166, 247), 'coder': (255, 168, 145), 'you': (255, 145, 200)}
+TONES = {'': WHITE, 'quiet': GREY, 'problem': (255, 85, 85), 'done': (166, 227, 161)}
+WHO = re.compile(r"\b(?:((?i:orchestrator))|((?i:coder))|((?i:you|your|yours))|(Relay))(?:'s)?\b")
+
+
+def paint(text, rgb, bold=True):
+    return f'\x1b[{"1;" if bold else ""}38;2;{rgb[0]};{rgb[1]};{rgb[2]}m{text}\x1b[0m' if text else ''
+
+
+def colour(text, base):
+    """The sentence in its tone's colour, with every mention of an agent or the human in theirs."""
+    parts, last = [], 0
+    for match in WHO.finditer(text):
+        parts.append(paint(text[last:match.start()], base))
+        who = 'orchestrator' if match[1] else 'coder' if match[2] else 'you' if match[3] else None
+        parts.append(paint(match[0], ROLE_COLOURS[who] if who else WHITE))
+        last = match.end()
+    parts.append(paint(text[last:], base))
+    return ''.join(parts)
+SHELLS = {'bash', 'zsh', 'fish', 'sh', 'dash'}
+BUSY = {'Working', 'Needs input', 'Starting'}
+PANE_FIELDS = ('pane_id', 'pane_pid', 'pane_current_command', 'pane_current_path', 'pane_title', 'window_id',
+               'session_id', '@name', '@workspace_status', '@pair_dir')
+
+
+# --- small helpers in the style of workspace-control -------------------------
+
+def run(args, *, check=True, **kwargs):
+    return subprocess.run([str(arg) for arg in args], check=check, text=True,
+                          capture_output=True, **kwargs)
+
+
+def spawn(args, **kwargs):
+    return subprocess.Popen([str(arg) for arg in args], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True, **kwargs)
+
+
+def tmux(*args, check=True, **kwargs):
+    selector = ['-S', SOCKET] if '/' in SOCKET else ['-L', SOCKET]
+    return run(['tmux', *selector, *args], check=check, **kwargs)
+
+
+def option(target, name, value):
+    tmux('set-option', '-p', '-t', target, name, str(value), check=False)
+
+
+def atomic_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, prefix='.', delete=False) as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+        temp = Path(file.name)
+    temp.replace(path)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def clean(text):
+    """Keep newlines and tabs; drop escape and other control bytes a terminal would act on."""
+    return re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', str(text))
+
+
+def notify(title, body=''):
+    spawn(['notify-send', '-a', 'Agent pair', '-i', 'utilities-terminal', '-t', '10000', title, body])
+
+
+def dialog(*args):
+    result = run(['zenity', *args], check=False)
+    return result.stdout.rstrip('\n') if result.returncode == 0 else None
+
+
+# --- agents and models -----------------------------------------------------
+
+def codex_models():
+    data = read_json(HOME / '.codex/models_cache.json', {})
+    models = data.get('models', []) if isinstance(data, dict) else []
+    listed = sorted((m for m in models if m.get('visibility') == 'list' and m.get('slug')),
+                    key=lambda m: m.get('priority', 99))
+    return [(m['slug'], m.get('display_name') or m['slug']) for m in listed] or [('gpt-6-astra', 'GPT-6-Astra')]
+
+
+def choices():
+    """(spec, label) for every agent/model the picker offers."""
+    rows = [('codex:' + slug, 'Codex · ' + name) for slug, name in codex_models()]
+    rows += [('claude:' + slug, 'Claude · ' + name) for slug, name in CLAUDE_MODELS]
+    return rows
+
+
+def parse_spec(text):
+    """'codex:gpt-6-astra:high' -> {'agent', 'model', 'effort'}; effort is optional."""
+    parts = text.split(':')
+    if parts[0] not in ('claude', 'codex') or len(parts) not in (2, 3) or not parts[1]:
+        raise ValueError('Agent must look like codex:gpt-6-astra or claude:claude-opus-5-5[:effort], not ' + text)
+    effort = parts[2] if len(parts) == 3 and parts[2] not in ('', 'default') else ''
+    if effort and effort not in EFFORTS + ('ultra',):
+        raise ValueError('Unknown effort ' + effort)
+    return {'agent': parts[0], 'model': parts[1], 'effort': effort}
+
+
+def describe(spec):
+    names = dict(codex_models() if spec['agent'] == 'codex' else CLAUDE_MODELS)
+    text = spec['agent'].title() + ' · ' + names.get(spec['model'], spec['model'])
+    return text + (' · ' + spec['effort'] if spec['effort'] else '')
+
+
+def binary(agent):
+    found = os.environ.get('AGENT_PAIR_' + agent.upper() + '_BIN') or shutil.which(agent)
+    if not found:
+        raise ValueError('Install ' + agent + ' and sign in first.')
+    return found
+
+
+# Turn start and end, a turn that failed or was interrupted, a conversation cleared or compacted, the agent
+# quitting, and tool calls as a heartbeat. Codex reports no failed turn: its screen says why it stopped.
+CLAUDE_HOOKS = ('UserPromptSubmit', 'Stop', 'StopFailure', 'SessionStart', 'SessionEnd', 'PostToolUse', 'PostToolUseFailure')
+CODEX_HOOKS = ('UserPromptSubmit', 'Stop', 'Interrupt', 'SessionStart', 'SessionEnd', 'PostToolUse')
+ACTIVITY = ('PreToolUse', 'PostToolUse', 'PostToolUseFailure')
+
+
+def agent_command(spec, role, folder, other, prompt):
+    brief = BRIEFS[role].format(other=other, folder=folder)
+    if spec['agent'] == 'claude':
+        hooks = {event: [{'hooks': [{'type': 'command', 'command': HOOK}]}] for event in CLAUDE_HOOKS}
+        args = [binary('claude'), '--model', spec['model'], '--settings', json.dumps({'hooks': hooks}),
+                '--append-system-prompt', brief]
+        if spec['effort']:
+            args += ['--effort', spec['effort']]
+    else:
+        # JSON strings are valid TOML basic strings, so json.dumps quotes -c values safely.
+        hook = '[{hooks=[{type="command",command=' + json.dumps(HOOK) + '}]}]'
+        args = [binary('codex'), '-m', spec['model']]
+        for event in CODEX_HOOKS:
+            args += ['-c', f'hooks.{event}=' + hook]
+        args += ['-c', 'developer_instructions=' + json.dumps(brief, ensure_ascii=False)]
+        if spec['effort']:
+            args += ['-c', 'model_reasoning_effort=' + json.dumps(spec['effort'])]
+    return args + ([prompt] if prompt else [])
+
+
+# --- starting a pair -------------------------------------------------------
+
+def create(folder, orchestrator, coder, task='', session=None):
+    """Write the pair folder and open its window; returns (pair folder, session id)."""
+    folder = str(Path(folder).resolve(strict=True))
+    if not Path(folder).is_dir() or any(c in folder for c in '\n\r\x1f'):
+        raise ValueError('Choose a folder with a single-line path.')
+    identifier = time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6]
+    directory = STATE / 'pairs' / identifier
+    (directory / 'events').mkdir(parents=True)
+    specs = {'orchestrator': orchestrator, 'coder': coder}
+    task = task.strip()
+    prompts = {'orchestrator': header('relay', 'orchestrator', 'task from the human') + '\n\n' + task if task else '',
+               'coder': HANDSHAKE}
+    config = {'id': identifier, 'folder': folder, 'task': task, 'roles': {}}
+    for role in ROLES:
+        other = 'coder' if role == 'orchestrator' else 'orchestrator'
+        config['roles'][role] = {**specs[role], 'label': describe(specs[role]),
+                                 'command': agent_command(specs[role], role, folder, describe(specs[other]), prompts[role])}
+    atomic_json(directory / 'config.json', config)
+    if task:
+        conversation(directory, 'You → Orchestrator (task)', task)
+
+    def command(*args):
+        return shlex.join([sys.executable, str(BIN), *args, str(directory)])
+
+    if session:
+        orchestrator_pane = tmux('new-window', '-P', '-F', '#{pane_id}', '-t', session + ':', '-n', 'Pair',
+                                 '-c', folder, command('run-agent', '--role', 'orchestrator')).stdout.strip()
+    else:
+        name = 'pair-' + identifier
+        orchestrator_pane = tmux('-f', CONFIG, 'new-session', '-d', '-P', '-F', '#{pane_id}', '-s', name, '-n', 'Pair',
+                                 '-c', folder, '-x', '200', '-y', '50', command('run-agent', '--role', 'orchestrator')).stdout.strip()
+        session = tmux('display-message', '-p', '-t', orchestrator_pane, '#{session_id}').stdout.strip()
+        tmux('set-option', '-t', session, '@workspace_path', folder)
+        tmux('set-option', '-t', session, '@workspace_label', 'Pair ' + str(int(session[1:]) + 1))
+    coder_pane = tmux('split-window', '-h', '-P', '-F', '#{pane_id}', '-t', orchestrator_pane, '-c', folder,
+                      command('run-agent', '--role', 'coder')).stdout.strip()
+    config['panes'] = {'orchestrator': orchestrator_pane, 'coder': coder_pane}
+    config['session'] = session
+    atomic_json(directory / 'config.json', config)
+    window = tmux('display-message', '-p', '-t', orchestrator_pane, '#{window_id}').stdout.strip()
+    config['relay_position'] = relay_position()
+    relay_pane = place_relay(window, orchestrator_pane, folder, command('relay'), config['relay_position'])
+    for role, identifier_ in config['panes'].items():
+        option(identifier_, '@name', config['roles'][role]['label'])
+        option(identifier_, '@role_label', role.title())  # The pane label shows the role in its colour.
+        option(identifier_, 'allow-passthrough', 'on')
+    option(relay_pane, '@name', 'Relay')
+    for identifier_ in (orchestrator_pane, coder_pane, relay_pane):
+        option(identifier_, '@pair_dir', directory)
+    config['relay_pane'] = relay_pane
+    atomic_json(directory / 'config.json', config)
+    tmux('select-pane', '-t', orchestrator_pane)
+    return directory, session
+
+
+# --- pairing agents that are already running ---------------------------------
+
+def pane_info(pane_id):
+    result = tmux('display-message', '-p', '-t', pane_id, SEP.join('#{' + f + '}' for f in PANE_FIELDS), check=False)
+    values = result.stdout.rstrip('\n').split(SEP) if result.returncode == 0 else []
+    return dict(zip(PANE_FIELDS, values + [''] * (len(PANE_FIELDS) - len(values))))
+
+
+def window_panes(window):
+    result = tmux('list-panes', '-t', window, '-F', SEP.join('#{' + f + '}' for f in PANE_FIELDS), check=False)
+    return [dict(zip(PANE_FIELDS, line.split(SEP))) for line in result.stdout.splitlines()]
+
+
+def place_relay(window, beside, folder, command, position):
+    """A full-width strip along the bottom, or the left column (above Directory when it is open)."""
+    directory_pane = next((p['pane_id'] for p in window_panes(window) if p['@name'] == 'Directory'), None)
+    if position == 'bottom':
+        args = ['-v', '-f', '-l', str(RELAY_LINES), '-t', beside]
+    elif directory_pane:
+        args = ['-v', '-b', '-l', '65%', '-t', directory_pane]
+    else:
+        args = ['-h', '-b', '-f', '-l', '24%', '-t', beside]
+    return tmux('split-window', *args, '-P', '-F', '#{pane_id}', '-c', folder, command).stdout.strip()
+
+
+def move_relay(directory, position):
+    config = read_json(directory / 'config.json', {})
+    relay, beside = config.get('relay_pane'), config.get('panes', {}).get('orchestrator')
+    info = pane_info(relay)
+    if not info['pane_id']:
+        raise ValueError('The relay pane has closed.')
+    directory_pane = next((p['pane_id'] for p in window_panes(info['window_id']) if p['@name'] == 'Directory'), None)
+    if position == 'bottom':
+        args = ['-v', '-f', '-l', str(RELAY_LINES), '-t', beside]
+    elif directory_pane:
+        args = ['-v', '-b', '-l', '65%', '-t', directory_pane]
+    else:
+        args = ['-h', '-b', '-f', '-l', '24%', '-t', beside]
+    tmux('move-pane', *args, '-s', relay)
+    config['relay_position'] = position
+    atomic_json(directory / 'config.json', config)
+    last = read_json(STATE / 'last.json', {})
+    atomic_json(STATE / 'last.json', {**last, 'relay_position': position})
+
+
+def relay_position():
+    return read_json(STATE / 'last.json', {}).get('relay_position', 'bottom')
+
+
+def running_agent(info):
+    """'claude' or 'codex' when one runs in the pane, also under the Agents… menu's small Python wrapper."""
+    command = info.get('pane_current_command')
+    if command in ('claude', 'codex'):
+        return command
+    if command in SHELLS or not info.get('pane_pid'):
+        return ''
+    todo, visited = [info['pane_pid']], 0
+    while todo and visited < 60:
+        pid, visited = todo.pop(), visited + 1
+        try:
+            name = Path(os.fsdecode(Path('/proc', pid, 'cmdline').read_bytes().split(b'\0')[0])).name
+            if name in ('claude', 'codex'):
+                return name
+            for task in Path('/proc', pid, 'task').iterdir():
+                todo += (task / 'children').read_text().split()
+        except OSError:
+            continue
+    return ''
+
+
+def busy(info):
+    title = info.get('pane_title') or ' '
+    return info.get('@workspace_status') in BUSY or '\u2800' <= title[0] <= '\u28ff'  # Codex spins a braille title.
+
+
+def shell_idle(pid):
+    try:
+        return not Path(f'/proc/{pid}/task/{pid}/children').read_text().strip()
+    except OSError:
+        return False
+
+
+def new_agent_pane(window, beside, folder, command):
+    """An idle shell pane in the window takes the new agent; otherwise it opens beside the running one."""
+    for p in window_panes(window):
+        if (p['pane_current_command'] in SHELLS and p['@name'] not in ('Directory', 'Relay') and not p['@pair_dir']
+                and shell_idle(p['pane_pid'])):
+            tmux('respawn-pane', '-k', '-t', p['pane_id'], '-c', folder, command)
+            return p['pane_id']
+    return tmux('split-window', '-h', '-P', '-F', '#{pane_id}', '-t', beside, '-c', folder, command).stdout.strip()
+
+
+def setup_text(config, role, task=''):
+    """The first message for an agent that joins: the brief, which a launched agent gets as its system prompt."""
+    other = 'coder' if role == 'orchestrator' else 'orchestrator'
+    brief = BRIEFS[role].format(other=config['roles'][other]['label'], folder=config['folder'])
+    ending = SETUP_END['orchestrator-task'].format(task=task) if task and role == 'orchestrator' else SETUP_END[role]
+    return JOINED.format(role=role, token=config['roles'][role]['token']) + brief + ending
+
+
+def join(sides, task=''):
+    """Pair agents already running in one window; their conversations carry over.
+
+    sides maps each role to {'pane': id} for a running agent or {'spec': spec} to start a new one.
+    """
+    attached = {role: side['pane'] for role, side in sides.items() if 'pane' in side}
+    if not attached:
+        raise ValueError('Choose at least one running agent.')
+    if len(set(attached.values())) < len(attached):
+        raise ValueError('Choose two different agents.')
+    infos = {role: pane_info(pane) for role, pane in attached.items()}
+    for info in infos.values():
+        if not running_agent(info):
+            raise ValueError((info['@name'] or info['pane_id'] or 'That pane') + ' is not running Claude or Codex.')
+        if info['@pair_dir']:
+            raise ValueError((info['@name'] or info['pane_id']) + ' is already in a pair.')
+    first = next(iter(infos.values()))
+    folder, window, session = first['pane_current_path'], first['window_id'], first['session_id']
+    identifier = time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6]
+    directory = STATE / 'pairs' / identifier
+    (directory / 'events').mkdir(parents=True)
+    task = task.strip()
+    labels = {role: running_agent(infos[role]).title() + ' · ' + (infos[role]['@name'] or infos[role]['pane_id'])
+              if role in infos else describe(sides[role]['spec']) for role in ROLES}
+    config = {'id': identifier, 'folder': folder, 'task': task, 'joined': True,
+              'session': session, 'roles': {}, 'setup': {}}
+    for role in ROLES:
+        other = 'coder' if role == 'orchestrator' else 'orchestrator'
+        if role in infos:
+            config['roles'][role] = {'agent': running_agent(infos[role]), 'model': '', 'effort': '', 'label': labels[role],
+                                     'attached': True, 'token': identifier + ':' + role, 'old_name': infos[role]['@name'],
+                                     'handshake': role == 'orchestrator' and not task,
+                                     # One a pair launched before reports through agent-pair's own hook.
+                                     'hooked': bool(tmux('show-option', '-p', '-v', '-t', attached[role],
+                                                         '@pair_launched', check=False).stdout.strip())}
+        else:
+            spec = sides[role]['spec']
+            if role == 'coder':
+                prompt = HANDSHAKE
+            elif task:
+                prompt = header('relay', 'orchestrator', 'setup') + ' The task: ' + task
+            else:
+                prompt = NEW_ORCHESTRATOR
+            config['roles'][role] = {**spec, 'label': labels[role], 'attached': False,
+                                     'handshake': role == 'orchestrator' and not task,
+                                     'command': agent_command(spec, role, folder, labels[other], prompt)}
+    for role in infos:
+        config['setup'][role] = setup_text(config, role, task)
+    atomic_json(directory / 'config.json', config)
+
+    def command(*args):
+        return shlex.join([sys.executable, str(BIN), *args, str(directory)])
+
+    panes = dict(attached)
+    for role in ROLES:
+        if role not in panes:
+            panes[role] = new_agent_pane(window, next(iter(attached.values())), folder, command('run-agent', '--role', role))
+    config['panes'] = panes
+    atomic_json(directory / 'config.json', config)
+    # Options go on before the relay starts, so Claude's workspace hook already forwards the first turn.
+    for role, pane in panes.items():
+        option(pane, '@pair_dir', directory)
+        option(pane, '@role_label', role.title())  # The pane label shows the role in its colour.
+        if config['roles'][role]['attached']:
+            option(pane, '@pair_role', role)
+            if not config['roles'][role]['old_name']:
+                option(pane, '@name', config['roles'][role]['agent'].title())
+        else:
+            option(pane, '@name', labels[role])
+            option(pane, 'allow-passthrough', 'on')
+    config['relay_position'] = relay_position()
+    relay_pane = place_relay(window, panes['orchestrator'], folder, command('relay'), config['relay_position'])
+    option(relay_pane, '@name', 'Relay')
+    option(relay_pane, '@pair_dir', directory)
+    config['relay_pane'] = relay_pane
+    atomic_json(directory / 'config.json', config)
+    if task:
+        conversation(directory, 'You → Orchestrator (task)', task)
+    tmux('select-pane', '-t', panes['orchestrator'])
+    return directory
+
+
+def release(directory, config):
+    """Give joined panes back: original names and no pair options. The agents keep running."""
+    for role, pane in config.get('panes', {}).items():
+        if tmux('display-message', '-p', '-t', pane, '#{@pair_dir}', check=False).stdout.strip() != str(directory):
+            continue
+        for name in ('@pair_dir', '@pair_role', '@role_label'):
+            tmux('set-option', '-p', '-u', '-t', pane, name, check=False)
+        if config['roles'][role].get('attached'):
+            old = config['roles'][role].get('old_name')
+            tmux('set-option', '-p', *(['-t', pane, '@name', old] if old else ['-u', '-t', pane, '@name']), check=False)
+        else:
+            option(pane, '@name', config['roles'][role]['label'])  # A launched agent keeps a plain name for the next pairing.
+    if config.get('relay_pane'):
+        tmux('set-option', '-p', '-u', '-t', config['relay_pane'], '@pair_dir', check=False)
+
+
+def end(directory):
+    """Stop the relay. A joined pair leaves its agents where they were; a pair window closes."""
+    config = read_json(directory / 'config.json', {})
+    send_control(directory, 'stop')
+    if config.get('joined'):
+        release(directory, config)
+        if config.get('relay_pane'):
+            tmux('kill-pane', '-t', config['relay_pane'], check=False)
+    else:
+        window = tmux('display-message', '-p', '-t', config.get('panes', {}).get('orchestrator', ''), '#{window_id}',
+                      check=False).stdout.strip()
+        if window:
+            tmux('kill-window', '-t', window, check=False)
+
+
+def attach(session):
+    inside = os.environ.get('TMUX', '')
+    expected = tmux('display-message', '-p', '#{socket_path}', check=False).stdout.strip()
+    if inside and inside.split(',')[0] == expected:
+        tmux('switch-client', '-t', session)
+        return
+    selector = ['-S', SOCKET] if '/' in SOCKET else ['-L', SOCKET]
+    args = ['tmux', *selector, 'attach-session', '-t', session]
+    if sys.stdout.isatty() and not inside:
+        os.execvp('tmux', args)
+    env = {key: value for key, value in os.environ.items() if key not in ('TMUX', 'TMUX_PANE')}
+    spawn(['xdg-terminal-exec', *args], env=env)
+
+
+def start_dialog(folder):
+    """Clickable form: both agents, their efforts and an optional task."""
+    last = read_json(STATE / 'last.json', {})
+    rows = choices()
+    labels = dict(rows)
+    def ordered(preferred):
+        return [labels[preferred]] + [label for spec, label in rows if spec != preferred] if preferred in labels else [l for _, l in rows]
+    orchestrator_default = last.get('orchestrator', 'codex:gpt-6-astra')
+    coder_default = last.get('coder', 'claude:claude-opus-5-5')
+    efforts = ['Default'] + list(EFFORTS)
+    def effort_values(preferred):
+        return [preferred] + [e for e in efforts if e != preferred] if preferred in efforts else efforts
+    result = dialog('--forms', '--title=Pair two agents', '--width=620', '--separator=' + SEP,
+                    '--text=The orchestrator plans and checks; the coder edits files.\n'
+                    'Folder: ' + folder.replace(str(HOME), '~') + '\nAn empty box uses the first choice shown.',
+                    '--add-combo=Orchestrator', '--combo-values=' + '|'.join(ordered(orchestrator_default)),
+                    '--add-combo=Orchestrator effort', '--combo-values=' + '|'.join(effort_values(last.get('orchestrator_effort', 'Default'))),
+                    '--add-combo=Coder', '--combo-values=' + '|'.join(ordered(coder_default)),
+                    '--add-combo=Coder effort', '--combo-values=' + '|'.join(effort_values(last.get('coder_effort', 'Default'))),
+                    '--add-multiline-entry=Task (optional: you can also tell the orchestrator yourself)',
+                    '--ok-label=Start pair')
+    if result is None:
+        return None
+    fields = (result.split(SEP) + [''] * 5)[:5]
+    by_label = {label: spec for spec, label in rows}
+    orchestrator = by_label.get(fields[0].strip(), orchestrator_default)
+    coder = by_label.get(fields[2].strip(), coder_default)
+    orchestrator_effort = fields[1].strip() or effort_values(last.get('orchestrator_effort', 'Default'))[0]
+    coder_effort = fields[3].strip() or effort_values(last.get('coder_effort', 'Default'))[0]
+    last.pop('max_rounds', None)  # Older versions had a round limit.
+    atomic_json(STATE / 'last.json', {**last, 'orchestrator': orchestrator, 'coder': coder,
+                                      'orchestrator_effort': orchestrator_effort, 'coder_effort': coder_effort})
+    def spec(base, effort):
+        return parse_spec(base + (':' + effort if effort != 'Default' else ''))
+    return {'orchestrator': spec(orchestrator, orchestrator_effort), 'coder': spec(coder, coder_effort),
+            'task': fields[4]}
+
+
+# --- inside the agent panes ------------------------------------------------
+
+def run_agent(directory, role):
+    config = read_json(directory / 'config.json')
+    # A pair started from inside another agent's shell must not inherit that session's identity or effort.
+    inherited = {key: value for key, value in os.environ.items()
+                 if not (key.startswith(('CLAUDE_CODE_', 'CODEX_')) and key != 'CODEX_HOME')
+                 and key not in ('CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'AI_AGENT')}
+    env = dict(inherited, AGENT_PAIR_DIR=str(directory), AGENT_PAIR_ROLE=role)
+    target = os.environ.get('TMUX_PANE')
+    if target:
+        option(target, '@workspace_agent', config['roles'][role]['agent'])
+        option(target, '@pair_launched', '1')
+    try:
+        subprocess.run(config['roles'][role]['command'], env=env, check=False)
+    finally:
+        write_event(directory, role, {'hook_event_name': 'Exited'})
+        if target:
+            tmux('set-option', '-p', '-u', '-t', target, '@pair_launched', check=False)
+        os.execvp('/bin/bash', ['/bin/bash', '-l'])
+
+
+def write_event(directory, role, data):
+    events = Path(directory) / 'events'
+    events.mkdir(parents=True, exist_ok=True)
+    data = {**data, 'role': role, 'time': time.time()}
+    with tempfile.NamedTemporaryFile(mode='w', dir=events, prefix='.', delete=False) as file:
+        json.dump(data, file, ensure_ascii=False)
+        temp = Path(file.name)
+    temp.replace(events / f'{time.time_ns()}-{role}.json')
+
+
+def hook_target():
+    """The pair this agent's pane belongs to now. Pane options win over the launch environment,
+    so an agent paired again reports to its new pair and never to one that has finished."""
+    env_dir, env_role = os.environ.get('AGENT_PAIR_DIR'), os.environ.get('AGENT_PAIR_ROLE')
+    socket_path, pane = os.environ.get('TMUX', '').split(',')[0], os.environ.get('TMUX_PANE')
+    if socket_path and pane:
+        result = run(['tmux', '-S', socket_path, 'display-message', '-p', '-t', pane,
+                      '#{@pair_dir}' + SEP + '#{@pair_role}'], check=False)
+        values = result.stdout.rstrip('\n').split(SEP)
+        if result.returncode == 0 and len(values) == 2:
+            if values[0] and values[1] in ROLES:
+                return values
+            if values[0] and values[0] != env_dir:
+                return None, None  # The pane now belongs to a different pair.
+    # A just-launched agent can report before its pane is labelled; a finished pair hears nothing more.
+    if env_dir and read_json(Path(env_dir) / 'status.json', {}).get('mode') == 'stopped':
+        return None, None
+    return env_dir, env_role
+
+
+def hook():
+    """Turn-start/turn-end hook for both agents. Silent, and never blocks the agent."""
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return
+    if not isinstance(data, dict):
+        return
+    directory, role = hook_target()
+    if not directory or role not in ROLES:
+        return
+    if data.get('hook_event_name') in ACTIVITY:
+        heartbeat(directory, role)
+        return
+    write_event(directory, role, {key: data.get(key) for key in EVENT_FIELDS if data.get(key) is not None})
+
+
+EVENT_FIELDS = ('hook_event_name', 'session_id', 'turn_id', 'prompt', 'last_assistant_message', 'model', 'transcript_path',
+                'source', 'reason', 'error', 'error_details')
+
+
+def heartbeat(directory, role):
+    """A tool call: the agent is working even when its screen looks still."""
+    (Path(directory) / f'heartbeat-{role}').touch()
+
+
+# --- the relay ---------------------------------------------------------------
+
+def conversation(directory, heading, text):
+    with (Path(directory) / 'conversation.md').open('a') as file:
+        file.write('### ' + time.strftime('%H:%M:%S') + ' · ' + heading + '\n\n' + text.strip() + '\n\n')
+
+
+def last_line(text):
+    lines = [line.strip().strip('*`_ ') for line in text.strip().splitlines() if line.strip()]
+    return lines[-1] if lines else ''
+
+
+WORKSPACE = None
+
+
+def codex_server():
+    """The workspace controller's read-only client for Codex's shared app server."""
+    global WORKSPACE
+    if WORKSPACE is None:
+        spec = importlib.util.spec_from_file_location('workspace_control', HOME / '.local/share/workspace/workspace.py')
+        WORKSPACE = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(WORKSPACE)
+    return WORKSPACE.AppServer()
+
+
+def turn_text(turn, kind):
+    items = [item for item in turn.get('items', []) if item.get('type') == kind]
+    if kind == 'userMessage':
+        return '\n'.join(part.get('text', '') for item in items for part in item.get('content', []) if part.get('type') == 'text')
+    final = [item for item in items if item.get('phase') == 'final_answer'] or items
+    return final[-1].get('text', '') if final else ''
+
+
+class CodexWatch:
+    """Turn events for a joined Codex, read from the shared app server: it was not started with the pair hooks."""
+    def __init__(self, relay, role):
+        self.relay, self.role = relay, role
+        self.token = relay.config['roles'][role]['token']
+        found = relay.status.setdefault('threads', {}).get(role) or {}
+        self.api, self.thread, self.seen, self.start = None, found.get('id'), {}, found.get('start', 0)
+        self.next, self.since, self.warned = 0, None, False
+        self.items, self.compactions = {}, set()
+
+    def poll(self):
+        if not self.relay.setup_sent[self.role] or time.monotonic() < self.next:
+            return
+        self.next = time.monotonic() + 1.0
+        self.since = self.since or time.time()
+        try:
+            if self.api is None:
+                self.api = codex_server()
+            if not self.thread:
+                self.find()
+            if not self.thread:
+                if not self.warned and time.time() - self.since > 30:
+                    self.warned = True
+                    self.relay.say(f"Cannot see the {self.role}'s Codex conversation on Codex's shared server, so its "
+                                   'replies cannot be relayed. Codex started with -c options runs on its own; start it '
+                                   'from Agents… instead.', 'problem')
+                return
+            turns = self.api.request('thread/turns/list', {'threadId': self.thread, 'limit': 4, 'itemsView': 'full'})['data']
+            for turn in sorted(turns, key=lambda t: t.get('startedAt') or 0):
+                if (turn.get('startedAt') or 0) < self.start:
+                    continue  # Older than the pair: the human's own conversation.
+                state, status = self.seen.get(turn['id']), turn.get('status')
+                if state is None:
+                    self.event('UserPromptSubmit', prompt=turn_text(turn, 'userMessage'))
+                    state = 'started'
+                items = turn.get('items', [])
+                for item in items:
+                    if item.get('type') == 'contextCompaction' and item.get('id') not in self.compactions:
+                        self.compactions.add(item.get('id'))
+                        self.event('SessionStart', source='compact')  # As Claude Code reports a compacted conversation.
+                if status == 'inProgress' and len(items) != self.items.get(turn['id']):
+                    self.items[turn['id']] = len(items)
+                    heartbeat(self.relay.dir, self.role)  # New items: the turn is moving.
+                if status != 'inProgress' and state != 'stopped':
+                    if status == 'interrupted':
+                        self.event('Interrupt')
+                    elif status == 'failed':
+                        error = turn.get('error') or {}
+                        info = error.get('codexErrorInfo')
+                        name = info if isinstance(info, str) else next(iter(info), 'unknown') if isinstance(info, dict) else 'unknown'
+                        self.event('StopFailure', error=name, error_details=error.get('message') or '')
+                    else:
+                        self.event('Stop', last_assistant_message=turn_text(turn, 'agentMessage'))
+                    state = 'stopped'
+                    self.items.pop(turn['id'], None)
+                self.seen[turn['id']] = state
+        except (OSError, ValueError, KeyError):
+            if self.api:
+                self.api.close()
+            self.api = None
+
+    def event(self, name, **fields):
+        write_event(self.relay.dir, self.role, {'hook_event_name': name, **fields})
+
+    def find(self):
+        """The conversation whose turns include this side's setup message."""
+        threads = self.api.request('thread/list', {'limit': 15, 'sortKey': 'updated_at', 'useStateDbOnly': True,
+                                                   'sourceKinds': ['cli', 'vscode', 'appServer']})['data']
+        for thread in threads:
+            if (thread.get('updatedAt') or 0) < self.since - 120:
+                continue
+            turns = self.api.request('thread/turns/list', {'threadId': thread['id'], 'limit': 10, 'itemsView': 'full'})['data']
+            mine = [t for t in turns if self.token in turn_text(t, 'userMessage')]
+            if mine:
+                self.thread = thread['id']
+                self.start = min(t.get('startedAt') or 0 for t in mine)
+                self.relay.status['threads'][self.role] = {'id': self.thread, 'start': self.start}
+                return
+
+
+class AgentGone(Exception):
+    pass
+
+
+def screen_print(pane):
+    """The agent's screen without its ticking timers and spinner glyphs, to tell a frozen turn from a working one."""
+    lines = [line for line in tmux('capture-pane', '-p', '-t', pane, check=False).stdout.splitlines() if line.strip()]
+    text = re.sub(r'[\d⠀-⣿✻✢✳✶✽✺·•*]+', '', '\n'.join(lines[-40:]))
+    return hashlib.sha256(' '.join(text.split()).encode()).hexdigest()
+
+
+def minutes(seconds):
+    return f'{seconds // 60} minutes' if seconds >= 120 else f'{seconds} second' + ('' if seconds == 1 else 's')
+
+
+# While a turn runs, Claude shows a spinner line such as "✢ Scampering… (27m 59s · ↓ 77k tokens)" and Codex
+# "• Working (3s • esc to interrupt)"; both footers say "esc to interrupt", which a narrow pane may cut short.
+BUSY_SCREEN = re.compile(r'esc to (interrupt|…)|…\s*\(\d+[hms]|\bWorking \(\d+[hms]')
+
+
+def screen_busy(pane):
+    lines = [line for line in tmux('capture-pane', '-p', '-t', pane, check=False).stdout.splitlines() if line.strip()]
+    return bool(BUSY_SCREEN.search('\n'.join(lines[-14:])))
+
+
+def screen_error(pane):
+    """The error a Codex turn stopped on, read off its screen; '' when there is none. Codex reports no
+    failed turn to its hooks: it shows the error as a "■" line, as it does an interrupted turn."""
+    lines = [line.strip() for line in tmux('capture-pane', '-p', '-J', '-t', pane, check=False).stdout.splitlines()]
+    for line in reversed([line for line in lines if line][-15:]):
+        if line.startswith('■ '):  # Only the latest one counts: an older error may still be on screen.
+            return '' if line.startswith('■ Conversation interrupted') else line[2:].strip()
+    return ''
+
+
+def error_name(text):
+    """A name for an error read off a screen, in Claude Code's words."""
+    text = text.lower()
+    if re.search(r'usage limit|rate limit|too many requests|\b429\b|quota|try again (at|in)', text):
+        return 'rate_limit'
+    if re.search(r'\b40[013]\b|unauthori[sz]ed|forbidden|not supported|invalid_request|log ?in|sign ?in|billing|context window', text):
+        return 'invalid_request'
+    return 'unknown'
+
+
+def failure_kind(error):
+    return 'rate_limit' if error in RATE_LIMITS else 'permanent' if error in PERMANENT else 'transient'
+
+
+def retry_wait(kind, count):
+    """Seconds before trying the failed turn again for the count-th time in a row; None to pause instead."""
+    waits = RETRY_WAITS[kind]
+    if count <= len(waits):
+        return waits[count - 1] * RETRY_SCALE
+    return waits[-1] * RETRY_SCALE if kind == 'rate_limit' else None
+
+
+def similar(a, b):
+    a, b = (' '.join(text.lower().split())[:3000] for text in (a, b))
+    if not (a and b):
+        return False
+    matcher = difflib.SequenceMatcher(None, a, b)  # The cheap upper bounds skip most full comparisons.
+    return matcher.real_quick_ratio() >= SIMILAR and matcher.quick_ratio() >= SIMILAR and matcher.ratio() >= SIMILAR
+
+
+SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', '.cache', 'dist', 'build'}
+
+
+def folder_state(folder):
+    """A fingerprint of the project's files, to notice rounds that change nothing."""
+    digest = hashlib.sha256()
+    status = run(['git', '-C', folder, 'status', '--porcelain=v1', '-uall', '-z'], check=False)
+    if status.returncode == 0:
+        digest.update(status.stdout.encode())
+        digest.update(run(['git', '-C', folder, 'diff', 'HEAD', '--no-ext-diff'], check=False).stdout.encode())
+        for entry in status.stdout.split('\0'):
+            if entry.startswith('?? '):
+                with contextlib.suppress(OSError):
+                    info = Path(folder, entry[3:]).stat()
+                    digest.update(f'{entry}{info.st_mtime_ns}{info.st_size}'.encode())
+        return digest.hexdigest()
+    count = 0
+    for root, folders, files in os.walk(folder):
+        folders[:] = sorted(f for f in folders if f not in SKIP_DIRS)
+        for name in sorted(files):
+            count += 1
+            if count > 20000:
+                return digest.hexdigest()
+            with contextlib.suppress(OSError):
+                info = os.stat(os.path.join(root, name))
+                digest.update(f'{root}/{name}{info.st_mtime_ns}{info.st_size}'.encode())
+    return digest.hexdigest()
+
+
+class Relay:
+    """Turn-taking between the two agents: one message in flight, replies matched to the round they answer."""
+
+    def __init__(self, directory):
+        self.dir = Path(directory)
+        self.config = read_json(self.dir / 'config.json')
+        self.panes = self.config['panes']
+        roles = self.config['roles']
+        saved = read_json(self.dir / 'status.json', {})
+        self.status = {'mode': 'running', 'reason': '', 'round': 0, 'reports': 0,
+                       'coder_ready': False, 'orchestrator_ready': not roles['orchestrator'].get('handshake'),
+                       'relayed': {'orchestrator': 0, 'coder': 0}, 'held': 0, 'models': {},
+                       # ball: whose reply moves the pair forward; open_round: the instruction the coder owes a report on.
+                       'ball': 'orchestrator', 'open_round': 0, 'held_notes': [], 'footnotes': [], 'nudged': {},
+                       'repeats': {}, 'last': {}, 'quiet': 0, 'fingerprint': '', 'stalls': {},
+                       # failures: a turn that stopped on an API error and when it is tried again; reminders: a note
+                       # for an agent whose conversation was compacted, sent with its next message.
+                       'failures': {}, 'reminders': {}, **saved}
+        if not saved:
+            self.status['fingerprint'] = folder_state(self.config['folder'])
+        # A restarted relay cannot know what happened while it was gone; assume both wait.
+        self.side = {role: 'idle' if saved else 'starting' for role in ROLES}
+        self.origin = {role: None for role in ROLES}  # Who started the running turn: relay, you or before.
+        self.queue = {role: [] for role in ROLES}
+        self.pending = {}
+        self.checked = self.watched = 0
+        self.started = time.monotonic()
+        self.warned = False
+        self.attached = {role: roles[role].get('attached', False) for role in ROLES}
+        # Launched agents get their brief at start; joined ones get it as their first relayed message.
+        self.setup_sent = {role: not self.attached[role] or bool(saved) for role in ROLES}
+        if not saved:
+            for role in ROLES:
+                if self.attached[role]:
+                    self.queue[role].append({'kind': 'setup', 'text': self.config['setup'][role]})
+        self.watchers = [CodexWatch(self, role) for role in ROLES
+                         if self.attached[role] and roles[role]['agent'] == 'codex' and not roles[role].get('hooked')]
+        self.watching = {watcher.role: watcher for watcher in self.watchers}
+        self.busy_warned = set()
+        self.idle_since, self.last_event = {}, {}
+        self.frozen = {}  # role -> (screen print, since): a busy screen that stopped changing.
+        self.interrupting = {}  # role -> when the relay pressed Esc; its next Stop is not a reply.
+        # When the coder answered the human while it still owed a report: after ENDED_SECONDS of quiet
+        # it is reminded to carry on and report, so a chat with it never leaves the pair waiting.
+        self.after_you = {}
+        self.stall_time = {}
+        self.last_human = 0
+        self.leaving = {}  # role -> when it said its session ended; the relay stops once the agent has gone.
+
+    # display and bookkeeping
+    def say(self, text, tone='', detail=''):
+        stamp = time.strftime('%H:%M')
+        line = paint(stamp, WHITE) + '  ' + colour(text, TONES[tone])
+        columns = shutil.get_terminal_size().columns
+        if detail and columns >= 100:
+            # The wide bottom strip: the exchange and the start of its text share one line.
+            room = columns - len(stamp) - len(text) - 6
+            tail = detail if len(detail) <= room else detail[:max(room - 1, 0)] + '…'
+            print(line + paint(' · ', WHITE) + paint(tail, GREY), flush=True)
+        else:
+            print(line, flush=True)
+            if detail:
+                width = max(20, columns - 9)
+                print('       ' + paint(detail if len(detail) <= width else detail[:width - 1] + '…', GREY), flush=True)
+        with (self.dir / 'relay.log').open('a') as file:
+            file.write(time.strftime('%H:%M:%S') + '  ' + text + (' · ' + detail if detail else '') + '\n')
+
+    def save(self):
+        self.status['held'] = sum(len(q) for q in self.queue.values()) if self.status['mode'] != 'running' else 0
+        self.status['sides'] = dict(self.side)
+        atomic_json(self.dir / 'status.json', self.status)
+        self.border()
+
+    def border(self):
+        """The Relay pane's border shows its state; Finished, Needs input and Error get the workspace colours."""
+        mode, reason, round_ = self.status['mode'], self.status['reason'], self.status['round']
+        if mode == 'running' and round_:
+            text = f'Round {round_}'
+        elif mode == 'running':
+            text = 'Ready' if self.status['coder_ready'] and self.status['orchestrator_ready'] else 'Starting'
+        elif mode == 'waiting':
+            text = 'Finished' if reason == 'done' else 'Needs input'
+        elif mode == 'paused':
+            text = 'Error' if reason == 'delivery failed' else 'Paused'
+        else:
+            text = {'by you': 'Stopped', 'done': 'Finished'}.get(reason, 'Error')
+        if text != getattr(self, 'shown', None) and os.environ.get('TMUX_PANE'):
+            self.shown = text
+            option(os.environ['TMUX_PANE'], '@workspace_status', text)
+
+    def label(self, role):
+        return role.title() + ' (' + self.config['roles'][role]['label'] + ')'
+
+    def wait(self, reason, text, *, alert=True):
+        self.status['mode'], self.status['reason'] = 'waiting', reason
+        self.say(text, 'problem')
+        if alert:
+            notify('Agent pair — ' + text, self.config['folder'].replace(str(HOME), '~'))
+
+    def resume(self):
+        self.status.update(mode='running', reason='', repeats={}, quiet=0, nudged={})
+        for failure in self.status['failures'].values():
+            if failure.get('due') is None:
+                failure.update(due=time.time(), count=0)
+        # The orchestrator owes the next message but has nothing coming (it stalled, or answered you while
+        # paused): without a word from the relay the pair would wait forever.
+        if (self.status['ball'] == 'orchestrator' and self.status['round'] and self.side['orchestrator'] == 'idle'
+                and not self.queue['orchestrator'] and 'orchestrator' not in self.pending
+                and 'orchestrator' not in self.status['failures']):
+            self.queue['orchestrator'].append({'kind': 'nudge', 'text': RESUMED_NOTE})
+        self.say('Resumed.')
+
+    def footnote(self, text):
+        if text not in self.status['footnotes']:
+            self.status['footnotes'].append(text)
+
+    # events
+    def handle(self, event):
+        role, name = event.get('role'), event.get('hook_event_name')
+        if role not in ROLES:
+            return
+        if event.get('model'):
+            self.status['models'][role] = event['model']
+        self.last_event[role] = time.monotonic()
+        self.idle_since.pop(role, None)
+        self.frozen.pop(role, None)
+        if name == 'Exited':
+            self.side[role] = 'gone'
+            self.status['mode'], self.status['reason'] = 'stopped', role + ' exited'
+            self.say(self.label(role) + ' exited. Relay stopped; the other agent keeps running.', 'problem')
+        elif name == 'UserPromptSubmit':
+            self.prompt(role, event.get('prompt') or '')
+        elif name == 'Stop':
+            self.reply(role, clean(event.get('last_assistant_message') or '').strip())
+        elif name == 'StopFailure':
+            self.failed(role, str(event.get('error') or 'unknown'),
+                        clean(event.get('error_details') or event.get('last_assistant_message') or '').strip())
+        elif name == 'Interrupt':
+            self.interrupted(role)
+        elif name == 'SessionStart':
+            self.session_start(role, event.get('source'))
+        elif name == 'SessionEnd' and event.get('reason') not in ('clear', 'resume'):
+            self.leaving[role] = time.monotonic()  # Quitting; the pane check confirms it.
+
+    def prompt(self, role, text):
+        # The turn that starts with the relay's message carries its first words; any other turn leaves
+        # the delivery waiting. A header alone also marks the relay's words (a launched agent's first prompt).
+        pending = self.pending.get(role)
+        ours = pending is not None and (not text.strip() or pending['signature'] in words(text))
+        if ours:
+            del self.pending[role]
+        relayed = ours or bool(RELAYED.search(text[:400]))
+        automatic = not relayed and bool(AUTOMATIC.match(text))
+        if not self.setup_sent[role]:
+            self.origin[role] = 'before'
+        elif automatic:
+            # The agent's own notice continues its work: a coder still owing a report keeps working
+            # for the relay; otherwise the turn is its own and its reply goes nowhere.
+            if self.origin[role] is None:
+                self.origin[role] = 'relay' if role == 'orchestrator' or self.status['open_round'] else 'auto'
+        elif not relayed:
+            self.origin[role] = 'you'  # Even mid-turn: an answer to the human stays with the human.
+            self.status['failures'].pop(role, None)  # The human has taken over: no retry on top of them.
+        elif self.origin[role] is None:
+            self.origin[role] = 'relay'
+        self.side[role] = 'working'
+        if relayed:
+            self.after_you.pop(role, None)
+        if relayed or automatic or not self.setup_sent[role]:
+            return
+        self.last_human = time.monotonic()
+        conversation(self.dir, 'You → ' + role.title(), text)
+        self.say('You messaged the ' + role + '.')
+
+    def reply(self, role, text):
+        origin, self.origin[role] = self.origin[role], None
+        self.side[role] = 'idle'
+        self.status['failures'].pop(role, None)
+        if role in self.interrupting:  # An agent may confirm the relay's Esc with an empty Stop.
+            del self.interrupting[role]
+            conversation(self.dir, role.title() + ' (stopped by the relay)', text or '(no reply text)')
+            self.stalled(role, 'stuck')
+            return
+        if origin is None and not text and time.monotonic() - self.stall_time.get(role, -60) < 60:
+            return  # A late confirmation of a stall the watchdog already handled.
+        if origin is None:
+            self.pending.pop(role, None)  # No turn start was seen, so this turn may well have been the relay's message.
+        ready = role + '_ready'
+        if not self.setup_sent[role] or origin == 'before' or (origin is None and self.attached[role] and not self.status[ready]):
+            self.say(f'The {role} finished a turn from before the pair; it is not forwarded.', 'quiet')
+            return
+        if not self.status[ready] and origin != 'relay':
+            self.say(f'The {role} answered a message of yours before its READY; that reply stays with you.', 'quiet')
+            return
+        if not self.status[ready]:
+            self.status[ready] = True
+            if self.status['round']:
+                self.say(f'The {role} has the pair brief again.')
+            else:
+                self.say('Coder is ready.' if role == 'coder' else 'Orchestrator is ready: tell it the task in its pane.')
+            return
+        if self.status['mode'] == 'stopped':
+            conversation(self.dir, role.title() + ' (not forwarded)', text or '(no reply text)')
+            return
+        text = COPIED_HEADER.sub('', text, count=1).strip() or text
+        if role == 'coder':
+            self.coder_reply(origin, text)
+        else:
+            self.orchestrator_reply(origin, text)
+
+    def coder_reply(self, origin, text):
+        open_round = self.status['open_round']
+        if origin == 'auto':
+            conversation(self.dir, 'Coder, after a background task (not forwarded)', text or '(no reply text)')
+            return
+        if not (origin == 'relay' or (origin is None and open_round)):
+            conversation(self.dir, 'Coder → You (not forwarded)', text or '(no reply text)')
+            self.say('The coder answered you; that reply stays with you.', 'quiet')
+            if open_round:
+                self.after_you['coder'] = time.monotonic()
+            return
+        self.after_you.pop('coder', None)
+        round_ = open_round or self.status['round']
+        self.status['open_round'] = 0
+        text = text or '(The coder ended its turn without a written report.)'
+        conversation(self.dir, f'Coder → Orchestrator · report on round {round_}', text)
+        self.queue['orchestrator'].append({'kind': 'report', 'round': round_, 'text': text})
+        self.status['reports'] += 1
+        if self.status['reports'] % REMINDER_EVERY == 0:
+            self.footnote(REMINDER)
+        self.progress_check()
+        self.loop_check('report', text)
+        if self.status['mode'] == 'paused':
+            self.say("Holding the coder's report until you resume.")
+
+    def orchestrator_reply(self, origin, text):
+        if not text:
+            conversation(self.dir, 'Orchestrator (not forwarded)', '(no reply text)')
+            self.say('The orchestrator ended its turn without a reply; nothing to forward.', 'problem')
+            return
+        if last_line(text) == 'PAIR-DONE':
+            # Final: the relay stops and lets the panes go, so nothing said afterwards is forwarded.
+            conversation(self.dir, 'Orchestrator · done', text)
+            self.status.update(mode='stopped', reason='done', held_notes=[], footnotes=[])
+            self.say('✓ Finished: the orchestrator ended the relay with PAIR-DONE.', 'done')
+            notify('Agent pair — finished', self.config['folder'].replace(str(HOME), '~'))
+            return
+        if self.status['mode'] != 'running' and origin != 'relay':
+            conversation(self.dir, 'Orchestrator → You (not forwarded: relay paused)', text)
+            self.say("The orchestrator answered you while the relay is paused; that reply stays with you.", 'quiet')
+            return
+        if self.status['ball'] == 'coder':
+            round_ = self.status['open_round'] or self.status['round']
+            self.status['held_notes'].append(text)
+            conversation(self.dir, f'Orchestrator · held until the report on round {round_}', text)
+            self.say(f"Holding the orchestrator's message: the coder is still on round {round_}. "
+                     'It goes back to the orchestrator with that report.')
+            return
+        self.status['round'] += 1
+        round_ = self.status['round']
+        conversation(self.dir, f'Orchestrator → Coder · round {round_}', text)
+        self.queue['coder'].append({'kind': 'instruction', 'round': round_, 'text': text})
+        self.status['ball'] = 'coder'
+        self.loop_check('instruction', text)
+        if self.status['mode'] == 'paused':
+            self.say("Holding the orchestrator's instruction until you resume.")
+
+    def failed(self, role, error, details=''):
+        """A turn that stopped on an API error: try it again later, or pause when waiting cannot help."""
+        origin, self.origin[role] = self.origin[role], None
+        self.side[role] = 'idle'
+        self.interrupting.pop(role, None)
+        conversation(self.dir, f'{role.title()} · stopped on an error ({error})', details or '(no details)')
+        open_round = self.status['open_round']
+        for_relay = origin == 'relay' or (origin is None and (open_round if role == 'coder' else self.status['ball'] == 'orchestrator'))
+        if not for_relay or self.status['mode'] == 'stopped':
+            if origin == 'you' and role == 'coder' and open_round:
+                self.after_you['coder'] = time.monotonic()  # Still owes its report: reminded later, as after any chat.
+            self.say(f'The {role} stopped on an error ({error}).', 'quiet')
+            return
+        failure = self.status['failures'].get(role) or {'count': 0}
+        failure.update(count=failure['count'] + 1, error=error, kind=failure_kind(error))
+        self.status['failures'][role] = failure
+        wait = retry_wait(failure['kind'], failure['count'])
+        if wait is None:
+            failure['due'] = None  # Tried again when you resume.
+            self.wait('error', f'The {role} stopped on an error ({error}). Look at its pane, then Resume.')
+            return
+        failure['due'] = time.time() + wait
+        self.say(f'The {role} stopped on an error ({error}); trying again in {minutes(round(wait))}.', 'problem')
+        if failure['kind'] == 'rate_limit' and failure['count'] == 1:
+            notify(f'Agent pair — the {role} hit a usage limit',
+                   'The relay keeps trying by itself and carries on when the limit resets.')
+
+    def retries(self):
+        """Send each failed turn's retry note once its wait is over."""
+        if self.status['mode'] != 'running':
+            return
+        for role, failure in self.status['failures'].items():
+            due = failure.get('due')
+            if due is None or time.time() < due or self.side[role] != 'idle' or role in self.pending:
+                continue
+            failure['due'] = None
+            self.queue[role].insert(0, {'kind': 'nudge', 'text': RETRY_NOTE[role].format(error=failure['error'])})
+            self.say(f'Trying the {role} again after the error ({failure["error"]}).')
+
+    def interrupted(self, role):
+        """Codex reports Esc as Interrupt, with no Stop."""
+        if role in self.interrupting:
+            del self.interrupting[role]
+            conversation(self.dir, role.title() + ' (stopped by the relay)', '(interrupted)')
+            self.stalled(role, 'stuck')
+        elif self.side[role] == 'working' and time.monotonic() - self.stall_time.get(role, -60) >= 60:
+            # Your Esc. The turn counts as ended without a reply: unless you write to the agent, it gets
+            # a note to carry on after ENDED_SECONDS, as a Claude does after Esc.
+            self.say(f"The {role}'s turn was interrupted.", 'quiet')
+
+    def session_start(self, role, source):
+        if source == 'compact':
+            if not self.attached[role]:
+                return  # A launched agent's brief is its system prompt, which compacting keeps.
+            if self.side[role] == 'working':
+                # Compacted mid-turn: that turn carries on, and the next message to it carries a reminder.
+                self.status['reminders'][role] = REMIND[role]
+                self.say(f"The {role}'s conversation was compacted; its next message reminds it of the relay.", 'quiet')
+            else:
+                # Compacted between turns (/compact): the brief may be gone, and the next message may be
+                # yours, so it gets the brief again now. Its READY is not forwarded.
+                self.queue[role] = [item for item in self.queue[role] if item['kind'] != 'setup']
+                self.queue[role].insert(0, {'kind': 'setup', 'text': setup_text(self.config, role), 'handshake': True})
+                self.status['reminders'].pop(role, None)
+                self.say(f"The {role}'s conversation was compacted; it gets the pair brief again.", 'quiet')
+        elif source in ('clear', 'resume'):
+            self.cleared(role, 'cleared' if source == 'clear' else 'switched to another conversation')
+
+    def cleared(self, role, what):
+        """/clear or /resume: the agent no longer knows the step it was on, and a joined one not even the pair."""
+        self.side[role], self.origin[role] = 'idle', None
+        for table in (self.interrupting, self.after_you, self.frozen, self.idle_since,
+                      self.status['failures'], self.status['reminders']):
+            table.pop(role, None)
+        self.queue[role] = [item for item in self.queue[role] if item['kind'] not in ('nudge', 'setup')]
+        if self.attached[role]:
+            self.setup_sent[role], self.status[role + '_ready'] = False, False
+            self.queue[role].insert(0, {'kind': 'setup', 'text': setup_text(self.config, role)})
+        again = ' It gets the pair brief again.' if self.attached[role] else ''
+        if role == 'coder' and self.status['open_round']:
+            round_, self.status['open_round'] = self.status['open_round'], 0
+            self.queue['orchestrator'].append({'kind': 'note', 'text': CLEARED_NOTE})
+            self.say(f"The coder's conversation was {what} while it owed the report on round {round_}; "
+                     'the orchestrator decides what next.' + again, 'problem')
+        else:
+            self.say(f"The {role}'s conversation was {what}." + again)
+
+    # runaway checks: a note to the orchestrator first, a pause only if it happens again after the note
+    def loop_check(self, kind, text):
+        repeats, last, nudged = self.status['repeats'], self.status['last'], self.status['nudged']
+        repeats[kind] = repeats.get(kind, 0) + 1 if similar(last.get(kind, ''), text) else 0
+        last[kind] = text[:4000]
+        both = repeats.get('instruction', 0) >= LOOP_REPEATS and repeats.get('report', 0) >= LOOP_REPEATS
+        if not (both or max(repeats.values()) >= 2 * LOOP_REPEATS):
+            if not any(repeats.values()):
+                nudged.pop('loop', None)  # A fresh message: the earlier note did its job.
+            return
+        if self.status['mode'] != 'running':
+            return
+        if nudged.get('loop'):
+            self.wait('loop', 'The agents still look stuck in a loop after a note. Resume to carry on.')
+            return
+        nudged['loop'], self.status['repeats'] = True, {}
+        self.footnote(LOOP_NOTE)
+        self.say('The last few messages look almost the same; the orchestrator gets a note with the next report.', 'problem')
+
+    def progress_check(self):
+        state, nudged = folder_state(self.config['folder']), self.status['nudged']
+        if state != self.status['fingerprint']:
+            self.status.update(fingerprint=state, quiet=0)
+            nudged.pop('quiet', None)
+            return
+        self.status['quiet'] += 1
+        if self.status['quiet'] < QUIET_ROUNDS or self.status['mode'] != 'running':
+            return
+        if nudged.get('quiet'):
+            self.wait('no progress', f'Another {QUIET_ROUNDS} reports changed no files after a note. Resume to carry on.')
+            return
+        nudged['quiet'], self.status['quiet'] = True, 0
+        self.footnote(QUIET_NOTE.format(count=QUIET_ROUNDS))
+        self.say(f'{QUIET_ROUNDS} reports in a row changed no files; the orchestrator gets a note with the next report.', 'problem')
+
+    # delivery
+    def compose(self, role, item):
+        kind, round_ = item['kind'], item.get('round', 0)
+        if item.get('composed'):
+            return item['composed']
+        if kind == 'setup':
+            return item['text']
+        head = {'instruction': header('orchestrator', 'coder'), 'report': header('coder', 'orchestrator'),
+                'note': header('relay', 'orchestrator'), 'nudge': header('relay', role)}[kind]
+        body = item['text']
+        # A reminder for an agent whose earlier messages were compacted away rides along with its next one.
+        reminders = self.status['reminders'].get(role)
+        if kind in ('report', 'note') and self.status['held_notes']:
+            body += HELD + '\n\n---\n\n'.join(self.status['held_notes'])
+        if kind in ('report', 'note') and self.status['footnotes']:
+            body += '\n\n' + '\n'.join(self.status['footnotes'])
+        if reminders:
+            body += '\n\n' + reminders
+        if len(body) > LONG:
+            messages = self.dir / 'messages'
+            messages.mkdir(exist_ok=True)
+            path = messages / f'{time.strftime("%H%M%S")}-{kind}-round-{round_}.md'
+            path.write_text(body)
+            body = (f'This message is {len(body):,} characters, so it was saved to a file. '
+                    f'Read the whole file before acting:\n{path}\n\nIt begins:\n\n' + body[:1500] + '\n…')
+        return head + '\n\n' + body
+
+    def send(self, role, text):
+        """Paste the message into the agent's pane and press Enter; returns 'paste'. A joined Codex whose
+        conversation is known gets it through Codex's own queue instead ('queue'): that never touches
+        what you may be typing in its composer, and never lands inside a running turn."""
+        target = self.panes[role]
+        # Never type into a pane whose agent has quit back to the shell: the shell would run the text.
+        if tmux('display-message', '-p', '-t', target, '#{pane_current_command}', check=False).stdout.strip() in SHELLS | {''}:
+            raise AgentGone(role)
+        watcher = self.watching.get(role)
+        if watcher and watcher.thread:
+            try:
+                result = run([binary('codex'), 'queue', '--thread', watcher.thread, '--message', text],
+                             check=False, timeout=30, cwd=self.config['folder'])
+                if result.returncode == 0:
+                    return 'queue'
+                problem = (result.stderr or result.stdout).strip().splitlines()[-1:] or ['no output']
+            except subprocess.TimeoutExpired:
+                return 'queue'  # It may well have been queued: never send it twice.
+            except (OSError, ValueError) as exc:
+                problem = [str(exc)]
+            self.say(f"Codex's queue did not take the message ({problem[0][:120]}); pasting it instead.", 'quiet')
+        buffer = 'pair-' + uuid.uuid4().hex
+        tmux('load-buffer', '-b', buffer, '-', input=text)
+        tmux('paste-buffer', '-p', '-d', '-b', buffer, '-t', target)
+        time.sleep(1.0)  # Let the TUI take in the bracketed paste before Enter submits it.
+        tmux('send-keys', '-t', target, 'Enter')
+        return 'paste'
+
+    def deliver(self):
+        """Send each agent its next message once it is free, and make sure the message started a turn.
+
+        A delivery is confirmed only by the turn whose prompt carries its first words. While the agent
+        is busy (its own turn, or one of yours) the delivery waits; once the screen has been quiet for
+        12 seconds a pasted message gets one more Enter, and after 45 seconds (90 for Codex's queue)
+        the relay pauses rather than lose it."""
+        now = time.monotonic()
+        for role, item in list(self.pending.items()):
+            if screen_busy(self.panes[role]):
+                item['busy'] = now  # A turn is running; the message may still be waiting behind it.
+                continue
+            quiet = now - max(item['since'], item.get('busy', 0))
+            if item['via'] == 'paste' and not item['retried'] and quiet >= 12:
+                tmux('send-keys', '-t', self.panes[role], 'Enter', check=False)
+                item['retried'] = True
+            elif quiet >= (45 if item['via'] == 'paste' else 90):
+                del self.pending[role]
+                self.queue[role].insert(0, {**item['item'], 'composed': item['text']})  # Sent again exactly as it was.
+                self.side[role] = 'idle'
+                self.status['mode'], self.status['reason'] = 'paused', 'delivery failed'
+                self.say(f'The {role} did not take the message. Check its pane for a question, then Resume.', 'problem')
+                notify('Agent pair — could not reach the ' + role, 'Check its pane, then resume the relay.')
+        if self.status['mode'] != 'running':
+            return
+        for role in ROLES:
+            if not self.queue[role] or role in self.pending or self.side[role] != 'idle':
+                continue
+            if screen_busy(self.panes[role]):
+                continue  # Still answering someone: a paste now would land inside that turn.
+            item = self.queue[role][0]
+            text = self.compose(role, item)
+            try:
+                via = self.send(role, text)
+            except subprocess.CalledProcessError:
+                continue
+            except AgentGone:
+                self.status['mode'], self.status['reason'] = 'stopped', role + ' is not running'
+                self.say(f'The {role} pane is back at a shell, so the relay stopped instead of typing into it.', 'problem')
+                return
+            self.queue[role].pop(0)
+            self.pending[role] = {'since': time.monotonic(), 'retried': False, 'item': item, 'text': text,
+                                  'via': via, 'signature': signature(text)}
+            self.side[role] = 'delivering'
+            kind, again = item['kind'], bool(item.get('composed'))
+            if not again:
+                self.status['reminders'].pop(role, None)  # It went with this message (or the brief).
+            if kind == 'setup':
+                self.setup_sent[role] = True
+                if item.get('handshake'):
+                    self.status[role + '_ready'] = False  # Its reply to the brief is a READY again.
+                self.say(f'Sent the pair brief to the {role}.')
+                continue
+            if kind == 'nudge':
+                self.say(f'Relay → {role.title()} · note', detail=item['text'])
+                continue
+            if kind == 'instruction':
+                self.status['open_round'] = item['round']
+                self.status['relayed']['orchestrator'] += not again
+            else:
+                self.status.update(ball='orchestrator', held_notes=[], footnotes=[])
+                if kind == 'report':
+                    self.status['relayed']['coder'] += not again
+            body = text.split('\n\n', 1)[-1]
+            title = {'instruction': f"Orchestrator → Coder · round {item.get('round')}",
+                     'report': f"Coder → Orchestrator · round {item.get('round')}",
+                     'note': 'Relay → Orchestrator · note'}[kind]
+            self.say(f'{title} · {len(body):,} chars', detail=' '.join(body.split())[:300])
+
+    def control(self):
+        folder = self.dir / 'control'
+        for path in sorted(folder.glob('*.json')) if folder.is_dir() else []:
+            command = (read_json(path, {}) or {}).get('command')
+            path.unlink(missing_ok=True)
+            if command == 'pause' and self.status['mode'] == 'running':
+                self.status['mode'], self.status['reason'] = 'paused', 'by you'
+                self.say('Paused. Replies are held until you resume; you can talk to either agent.')
+            elif command == 'resume' and self.status['mode'] in ('paused', 'waiting'):
+                self.resume()
+            elif command == 'skip' and self.status['ball'] == 'coder':
+                round_ = self.status['open_round'] or self.status['round']
+                self.queue['coder'] = [item for item in self.queue['coder'] if item['kind'] not in ('instruction', 'nudge')]
+                self.status['open_round'] = 0
+                self.status['failures'].pop('coder', None)
+                self.after_you.pop('coder', None)
+                # The coder's turn ended without its hook (Esc), so it is free again; the screen check still guards the paste.
+                self.side['coder'], self.origin['coder'] = 'idle', None
+                self.queue['orchestrator'].append({'kind': 'note', 'text': SKIP_NOTE})
+                self.say(f"Stopped waiting for the coder's report on round {round_}; the orchestrator decides what next.")
+            elif command == 'stop':
+                self.status['mode'], self.status['reason'] = 'stopped', 'by you'
+                self.say('Relay stopped. Both agents keep running as normal chats.')
+
+    def startup_warning(self):
+        expected = [r for r in ROLES if r == 'coder' or self.config.get('task')]
+        stuck = [r for r in expected if self.side[r] == 'starting' and not (r == 'coder' and self.status['coder_ready'])]
+        if stuck and not self.warned and time.monotonic() - self.started > 25:
+            self.warned = True
+            self.say('Still waiting for the ' + ' and '.join(stuck) + ' to start. If its pane shows a question '
+                     '(folder trust or hook review), answer it there.')
+
+    def refresh_attached(self):
+        """Until a joined agent gets its brief, its pane state says whether it is free."""
+        for role in ROLES:
+            if self.attached[role] and not self.setup_sent[role] and role not in self.pending:
+                waiting = busy(pane_info(self.panes[role])) or screen_busy(self.panes[role])
+                self.side[role] = 'busy' if waiting else 'idle'
+                if waiting and role not in self.busy_warned and time.monotonic() - self.started > 20:
+                    self.busy_warned.add(role)
+                    self.say(f'Waiting for the {role} to finish its current turn before it joins.')
+
+    def watchdog(self):
+        """Overnight nobody is there to press Esc or say "carry on", so the relay does.
+
+        A turn that ended without its Stop hook (Esc on Claude) gets a note after ENDED_SECONDS of idle screen.
+        A busy screen frozen for STUCK_SECONDS (a hung command) is stopped with Esc, then gets a note.
+        The same agent stalling twice on one step goes to the orchestrator (coder) or pauses the pair."""
+        now = time.monotonic()
+        if now - self.watched < min(20, ENDED_SECONDS / 4, STUCK_SECONDS / 4):
+            return
+        self.watched = now
+        since = self.after_you.get('coder')
+        if (since is not None and now - since >= ENDED_SECONDS and self.status['mode'] == 'running'
+                and self.side['coder'] == 'idle' and self.status['open_round'] and not self.queue['coder']
+                and 'coder' not in self.pending):
+            del self.after_you['coder']
+            self.queue['coder'].insert(0, {'kind': 'nudge', 'text': ENDED_NOTE['coder']})
+            self.say('The coder still owes its report after talking to you; sending it a note.')
+        for role in ROLES:
+            pane = self.panes[role]
+            if self.side[role] != 'working' or self.status['mode'] != 'running':
+                self.idle_since.pop(role, None)
+                self.frozen.pop(role, None)
+                continue
+            if role in self.interrupting:
+                # Claude reports no Stop after Esc: an idle screen, or 15 seconds, says the step has stopped.
+                if not screen_busy(pane) or now - self.interrupting[role] > 15:
+                    del self.interrupting[role]
+                    self.stalled(role, 'stuck')
+                continue
+            if screen_busy(pane):
+                self.idle_since.pop(role, None)
+                screen = screen_print(pane)
+                print_, since = self.frozen.get(role, (None, now))
+                if screen != print_:
+                    self.frozen[role] = (screen, now)
+                elif now - since >= STUCK_SECONDS and self.quiet_for(role) >= STUCK_SECONDS:
+                    self.frozen.pop(role, None)
+                    self.say(f'The {role} has shown no change for {minutes(STUCK_SECONDS)}; stopping that step.', 'problem')
+                    tmux('send-keys', '-t', pane, 'Escape', check=False)
+                    self.interrupting[role] = now
+                continue
+            self.frozen.pop(role, None)
+            since = self.idle_since.setdefault(role, now)
+            if now - since >= ENDED_SECONDS and self.quiet_for(role) >= ENDED_SECONDS:
+                self.idle_since.pop(role, None)
+                error = screen_error(pane) if self.config['roles'][role]['agent'] == 'codex' else ''
+                if error:
+                    self.failed(role, error_name(error), error)  # A Codex turn that failed: its hooks never said.
+                else:
+                    self.stalled(role, 'ended')
+
+    def quiet_for(self, role):
+        """Seconds since the agent last showed it was working: any event, a tool call, a new Codex turn item."""
+        try:
+            beat = time.time() - (self.dir / f'heartbeat-{role}').stat().st_mtime
+        except OSError:
+            beat = float('inf')
+        return min(beat, time.monotonic() - self.last_event.get(role, float('-inf')))
+
+    def stalled(self, role, kind):
+        """Send the stalled agent back to work, unless it already stalled on this step."""
+        self.side[role], self.origin[role] = 'idle', None
+        self.stall_time[role] = time.monotonic()
+        if role == 'coder' and not self.status['open_round']:
+            # A coder owing no report was answering you or itself: "carry on, then report" would
+            # send the orchestrator a report nobody asked for.
+            self.say("The coder's turn ended without a reply; it owes no report, so it gets no note.", 'quiet')
+            return
+        step = str(self.status['open_round'] if role == 'coder' else self.status['round'])
+        stalls = self.status['stalls'].setdefault(role, {})
+        stalls[step] = stalls.get(step, 0) + 1
+        if stalls[step] >= 2:
+            if role == 'coder':
+                self.status['open_round'] = 0
+                self.queue['orchestrator'].append({'kind': 'note', 'text': TWICE_NOTE})
+                self.say('The coder stalled twice on this step; the orchestrator decides what next.', 'problem')
+            else:
+                self.wait('stuck', 'The orchestrator stalled twice in a row. Resume when you have looked at it.')
+            return
+        note = (STUCK_NOTE[role].format(minutes=minutes(STUCK_SECONDS)) if kind == 'stuck' else ENDED_NOTE[role])
+        self.queue[role].insert(0, {'kind': 'nudge', 'text': note})
+        self.say(f"The {role}'s turn {'was stuck' if kind == 'stuck' else 'ended without a reply'}; sending it a note.", 'problem')
+
+    def panes_alive(self):
+        if time.monotonic() - self.checked < (1 if self.leaving else 3):
+            return True
+        self.checked = time.monotonic()
+        for role, since in list(self.leaving.items()):
+            if not running_agent(pane_info(self.panes[role])):
+                self.leaving.clear()
+                self.side[role] = 'gone'
+                self.status['mode'], self.status['reason'] = 'stopped', role + ' exited'
+                self.say(self.label(role) + ' exited. Relay stopped; the other agent keeps running.', 'problem')
+                return False
+            if self.checked - since > 20:
+                del self.leaving[role]  # Still running: it did not quit after all.
+        for role in ROLES:
+            if tmux('display-message', '-p', '-t', self.panes[role], '#{pane_id}', check=False).returncode:
+                self.status['mode'], self.status['reason'] = 'stopped', role + ' pane closed'
+                self.say('The ' + role + ' pane closed. Relay stopped.', 'problem')
+                return False
+        return True
+
+    def step(self, events, done):
+        self.control()
+        for watcher in self.watchers:
+            watcher.poll()
+        for path in sorted(events.glob('*.json')):
+            event = read_json(path)
+            path.replace(done / path.name)
+            if event:
+                self.handle(event)
+        self.refresh_attached()
+        self.retries()
+        self.deliver()
+        self.startup_warning()
+        self.watchdog()
+        self.panes_alive()
+        self.save()
+
+    def loop(self):
+        roles = self.config['roles']
+        self.say(f"Pair · orchestrator {roles['orchestrator']['label']} · coder {roles['coder']['label']}")
+        self.say('Right-click → Pair controls… to pause, resume, move this pane or read the conversation.', 'quiet')
+        if self.config.get('joined'):
+            self.say('Pairing agents that were already running; their conversations carry over. '
+                     'When both say READY, give the orchestrator the task.')
+        elif not self.config.get('task'):
+            self.say('Tell the orchestrator the task in its pane; its reply goes to the coder.')
+        events = self.dir / 'events'
+        done = events / 'done'
+        done.mkdir(parents=True, exist_ok=True)
+        while self.status['mode'] != 'stopped':
+            try:
+                self.step(events, done)
+            except Exception as exc:  # A long unattended run must not die silently on one bad turn.
+                self.say(f'Relay error, carrying on: {type(exc).__name__}: {exc}', 'problem')
+                time.sleep(2)
+            time.sleep(0.4)
+        self.save()
+        release(self.dir, self.config)  # Right-click → Pair two agents… can pair the same agents again.
+        print('\nThe relay has stopped. Close this pane when you are done; pair again for a new task.\nConversation: '
+              + str(self.dir / 'conversation.md'), flush=True)
+        while True:
+            time.sleep(3600)
+
+
+# --- menu and controls -----------------------------------------------------
+
+def pair_of(pane_id):
+    value = tmux('show-option', '-p', '-v', '-t', pane_id, '@pair_dir', check=False).stdout.strip()
+    return Path(value) if value and (Path(value) / 'config.json').is_file() else None
+
+
+def send_control(directory, command):
+    atomic_json(directory / 'control' / f'{time.time_ns()}.json', {'command': command})
+
+
+def window_pair(pane_id):
+    window = tmux('display-message', '-p', '-t', pane_id, '#{window_id}').stdout.strip()
+    for row in tmux('list-panes', '-t', window, '-F', '#{pane_id}').stdout.split():
+        found = pair_of(row)
+        if found:
+            return found
+    return None
+
+
+def action(pane_id):
+    """Right-click → Pair: controls for this window's pair, otherwise pair the agents already running here."""
+    directory = window_pair(pane_id)
+    if directory:
+        controls(pane_id, directory)
+    else:
+        choose_pairing(pane_id)
+
+
+def controls(pane_id, directory):
+    status = read_json(directory / 'status.json', {})
+    config = read_json(directory / 'config.json', {})
+    mode = status.get('mode', 'running')
+    rows = [('pause', 'Pause the relay (talk to either agent privately)')] if mode == 'running' else \
+           [('resume', 'Resume the relay')]
+    if status.get('ball') == 'coder' and status.get('open_round'):
+        rows += [('skip', f"Stop waiting for the coder's report on round {status['open_round']}")]
+    rows += [('read', 'Read the pair conversation in Text Editor')]
+    if config.get('relay_position', 'bottom') == 'left':
+        rows += [('move-bottom', 'Move the relay to the bottom')]
+    else:
+        rows += [('move-left', 'Move the relay to the left column')]
+    rows += [('end', 'Unpair (both agents keep running here)' if config.get('joined') else 'End this pair (close its window)'),
+             ('new', 'Start another pair in a new window')]
+    args = ['--list', '--title=Agent pair', '--width=560', '--height=330',
+            f"--text=Relay: {mode}{' — ' + status['reason'] if status.get('reason') else ''} · "
+            f"round {status.get('round', 0)}",
+            '--column=ID', '--column=Action', '--hide-column=1', '--print-column=1', '--ok-label=Choose']
+    for key, label in rows:
+        args += [key, label]
+    selected = dialog(*args)
+    if selected in ('pause', 'resume', 'skip'):
+        send_control(directory, selected)
+    elif selected == 'read':
+        spawn(['gnome-text-editor', directory / 'conversation.md'])
+    elif selected in ('move-left', 'move-bottom'):
+        move_relay(directory, selected.split('-')[1])
+    elif selected == 'end':
+        question = 'Unpair these agents? Both keep running as normal chats.' if config.get('joined') else \
+                   'Close this pair window and stop both agents?'
+        if dialog('--question', '--title=Agent pair', '--text=' + question) is not None:
+            end(directory)
+    elif selected == 'new':
+        start_from_pane(pane_id)
+
+
+def choose_pairing(pane_id):
+    """Two running agents pair in one click; with one, a partner starts next to it; with none, the full form."""
+    info = pane_info(pane_id)
+    agents = sorted((p for p in window_panes(info['window_id']) if running_agent(p) and not p['@pair_dir']),
+                    key=lambda p: p['pane_id'] != pane_id)
+
+    def name(p):
+        return running_agent(p).title() + ' (' + (p['@name'] or p['pane_id']) + ')'
+
+    rows = []
+    if len(agents) >= 2:
+        clicked = [p for p in agents if p['pane_id'] == pane_id]
+        pairs = [(a, b) for a in agents for b in agents if a is not b and (not clicked or pane_id in (a['pane_id'], b['pane_id']))]
+        # Codex usually orchestrates, so Codex directing Claude is offered first.
+        pairs.sort(key=lambda ab: (not (running_agent(ab[0]) == 'codex' and running_agent(ab[1]) == 'claude'),
+                                   ab[0]['pane_id'] != pane_id))
+        rows = [('join:' + a['pane_id'] + ':' + b['pane_id'], name(a) + ' orchestrates · ' + name(b) + ' codes')
+                for a, b in pairs]
+        text = 'Pair the agents already running in this window. Their conversations carry over.'
+    elif len(agents) == 1:
+        a = agents[0]
+        rows = [('one:orchestrator:' + a['pane_id'], name(a) + ' orchestrates · start a new coder next to it…'),
+                ('one:coder:' + a['pane_id'], name(a) + ' codes · start a new orchestrator next to it…')]
+        text = 'One agent is running in this window. Its conversation carries over.'
+    if not rows:
+        start_from_pane(pane_id)
+        return
+    rows.append(('new', 'Start two new agents in a new Pair window…'))
+    args = ['--list', '--title=Pair two agents', '--width=620', '--height=320', '--text=' + text,
+            '--column=ID', '--column=Pairing', '--hide-column=1', '--print-column=1', '--ok-label=Pair']
+    for key, label in rows:
+        args += [key, label]
+    selected = dialog(*args)
+    if not selected:
+        return
+    if selected == 'new':
+        start_from_pane(pane_id)
+    elif selected.startswith('join:'):
+        _, orchestrator, coder = selected.split(':')
+        join({'orchestrator': {'pane': orchestrator}, 'coder': {'pane': coder}})
+    else:
+        _, role, pane = selected.split(':')
+        other = 'coder' if role == 'orchestrator' else 'orchestrator'
+        spec = partner_dialog(other, running_agent(pane_info(pane)))
+        if spec:
+            join({role: {'pane': pane}, other: {'spec': spec}})
+
+
+def partner_dialog(role, existing):
+    """Pick the agent to start next to a running one; the other vendor comes first, since mixing models is the point."""
+    last = read_json(STATE / 'last.json', {})
+    rows = choices()
+    preferred = last.get(role, '')
+    if preferred.split(':')[0] in ('', existing) or preferred not in dict(rows):
+        preferred = next((spec for spec, _ in rows if not spec.startswith(existing + ':')), rows[0][0])
+    labels = [dict(rows)[preferred]] + [label for spec, label in rows if spec != preferred]
+    efforts = ['Default'] + list(EFFORTS)
+    result = dialog('--forms', '--title=Start the ' + role, '--width=520', '--separator=' + SEP,
+                    '--text=The new ' + role + ' opens in an idle shell pane in this window, or beside the running agent.',
+                    '--add-combo=' + role.title(), '--combo-values=' + '|'.join(labels),
+                    '--add-combo=Effort', '--combo-values=' + '|'.join(efforts), '--ok-label=Start and pair')
+    if result is None:
+        return None
+    fields = (result.split(SEP) + ['', ''])[:2]
+    spec = {label: spec for spec, label in rows}.get(fields[0].strip(), preferred)
+    effort = fields[1].strip()
+    atomic_json(STATE / 'last.json', {**last, role: spec})
+    return parse_spec(spec + (':' + effort if effort and effort != 'Default' else ''))
+
+
+def start_from_pane(pane_id):
+    session, folder = tmux('display-message', '-p', '-t', pane_id,
+                           '#{session_id}' + SEP + '#{?@workspace_path,#{@workspace_path},#{pane_current_path}}').stdout.strip().split(SEP)
+    chosen = start_dialog(folder)
+    if chosen:
+        create(folder, chosen['orchestrator'], chosen['coder'], chosen['task'], session=session)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='command')
+    starting = sub.add_parser('start', help='Start a pair (no options: open the clickable form)')
+    starting.add_argument('--folder', default=os.getcwd())
+    starting.add_argument('--orchestrator', help='codex:gpt-6-astra[:effort] or claude:claude-fable-5-1[:effort]')
+    starting.add_argument('--coder', help='Same format as --orchestrator')
+    starting.add_argument('--task', default='')
+    starting.add_argument('--task-file')
+    starting.add_argument('--detached', action='store_true', help='Print the pair folder instead of attaching')
+    joining = sub.add_parser('join', help='Pair agents already running in tmux panes (prints the pair folder)')
+    joining.add_argument('--orchestrator-pane')
+    joining.add_argument('--coder-pane')
+    joining.add_argument('--orchestrator', help='Start a new orchestrator instead (agent:model[:effort])')
+    joining.add_argument('--coder', help='Start a new coder instead (agent:model[:effort])')
+    joining.add_argument('--task', default='')
+    for name in ('pause', 'resume', 'skip', 'stop', 'status', 'end'):
+        control = sub.add_parser(name, help=name.title() + ' a pair')
+        control.add_argument('pair', type=Path)
+    moving = sub.add_parser('move-relay', help='Put the relay pane in the left column or along the bottom')
+    moving.add_argument('pair', type=Path)
+    moving.add_argument('position', choices=('left', 'bottom'))
+    for name in ('relay', 'run-agent'):
+        inner = sub.add_parser(name)
+        if name == 'run-agent':
+            inner.add_argument('--role', choices=ROLES, required=True)
+        inner.add_argument('pair', type=Path)
+    menu = sub.add_parser('action')
+    menu.add_argument('pane')
+    sub.add_parser('hook')
+    sub.add_parser('models', help='List the agent:model choices')
+    sub.add_parser('colours', help='Show a sample of the relay strip in its colours')
+    args = parser.parse_args()
+    try:
+        if args.command == 'hook':
+            hook()
+        elif args.command == 'relay':
+            Relay(args.pair).loop()
+        elif args.command == 'run-agent':
+            run_agent(args.pair, args.role)
+        elif args.command == 'action':
+            action(args.pane)
+        elif args.command == 'colours':
+            sample = [('Coder is ready.', '', ''), ('You messaged the orchestrator.', '', ''),
+                      ('Orchestrator → Coder · round 1 · 3,238 chars', '', 'Claude, proceed with the agreed desktop prototype…'),
+                      ('Coder → Orchestrator · round 1 · 1,722 chars', '', 'Done: the row works and every check passes…'),
+                      ('The coder answered you; that reply stays with you.', 'quiet', ''),
+                      ("Holding the orchestrator's message: the coder is still on round 2.", '', ''),
+                      ('The last few messages look almost the same; the orchestrator gets a note with the next report.', 'problem', ''),
+                      ('Relay → Coder · note', '', '(Relay note: your last turn ended without a report. Carry on…)'),
+                      ('✓ Finished: the orchestrator ended the relay with PAIR-DONE.', 'done', '')]
+            for text, tone, detail in sample:
+                stamp = time.strftime('%H:%M')
+                print(paint(stamp, WHITE) + '  ' + colour(text, TONES[tone])
+                      + (paint(' · ', WHITE) + paint(detail, GREY) if detail else ''))
+        elif args.command == 'models':
+            for spec, label in choices():
+                print(f'{spec:32} {label}')
+        elif args.command in ('pause', 'resume', 'skip', 'stop'):
+            send_control(args.pair, args.command)
+        elif args.command == 'status':
+            print(json.dumps(read_json(args.pair / 'status.json', {}), indent=2))
+        elif args.command == 'end':
+            end(args.pair)
+        elif args.command == 'move-relay':
+            move_relay(args.pair, args.position)
+        elif args.command == 'join':
+            sides = {}
+            for role in ROLES:
+                pane, spec = getattr(args, role + '_pane'), getattr(args, role)
+                if bool(pane) == bool(spec):
+                    raise ValueError(f'Give either --{role}-pane or --{role}.')
+                sides[role] = {'pane': pane} if pane else {'spec': parse_spec(spec)}
+            print(join(sides, args.task))
+        else:
+            options = args if args.command == 'start' else None
+            if options and options.orchestrator and options.coder:
+                task = Path(options.task_file).read_text() if options.task_file else options.task
+                chosen = {'orchestrator': parse_spec(options.orchestrator), 'coder': parse_spec(options.coder),
+                          'task': task}
+                folder = options.folder
+            else:
+                folder = options.folder if options else os.getcwd()
+                chosen = start_dialog(str(Path(folder).resolve()))
+                if not chosen:
+                    return 0
+            directory, session = create(folder, chosen['orchestrator'], chosen['coder'], chosen['task'])
+            if options and options.detached:
+                print(directory)
+            else:
+                attach(session)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        if args.command == 'hook':
+            return 0
+        if sys.stdin.isatty():
+            print('agent-pair: ' + str(exc), file=sys.stderr)
+        else:
+            dialog('--error', '--title=Agent pair', '--text=' + str(exc))
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

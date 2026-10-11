@@ -1,0 +1,12 @@
+{
+  "name": "AMOLED Black",
+  "base": "dark",
+  "overrides": {
+    "text": "#ffffff",
+    "userMessageBackground": "#1a1a1a",
+    "userMessageBackgroundHover": "#2f2f2f",
+    "bashMessageBackgroundColor": "#1a1a1a",
+    "memoryBackgroundColor": "#1a1a1a",
+    "selectionBg": "#3f3f3f"
+  }
+}

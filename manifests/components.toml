@@ -1,0 +1,68 @@
+# The parts of the setup, what each needs, and what the installer turns on.
+# files.toml says which files belong to each component.
+#
+#   requires   components installed with this one
+#   apt, snap  packages the installer adds when missing (it never upgrades);
+#              a snap is {name, classic}
+#   commands   programs the component uses but does not install
+#   units      systemd user units enabled after installing
+#   gsettings  GNOME settings applied (see the file for its operations)
+
+format = 1
+default = ["terminal", "workspace", "agents", "memory", "clipboard", "gnome-look"]
+
+# The tested target. Elsewhere the installer stops with an explanation.
+[supported]
+os = "ubuntu"
+version = "26.04"
+desktop = "GNOME"
+gnome = "50"
+session = "wayland"
+architectures = ["amd64"]
+python = "3.11"
+
+[component.terminal]
+summary = "Ghostty in pure black, JetBrains Mono, Bash tools and matching colours"
+requires = []
+apt = ["ghostty", "fonts-jetbrains-mono", "fonts-noto-color-emoji", "bat", "eza", "glow", "micro",
+       "starship", "zoxide", "fzf", "atuin", "fd-find", "ripgrep", "less", "wl-clipboard",
+       "xdg-terminal-exec", "git", "python3", "desktop-file-utils", "fontconfig", "libglib2.0-bin",
+       "gnome-text-editor", "loupe", "papers"]  # the default apps in mime-defaults.json
+snap = [{ name = "yazi", classic = true }]  # also provides ya
+gsettings = "payload/terminal/gsettings.json"
+
+[component.workspace]
+summary = "Mouse-driven tmux workspace for two agents, with Directory, menus and layout recovery"
+requires = ["terminal"]
+apt = ["tmux", "zenity", "htop", "meld", "libnotify-bin"]
+units = ["workspace-monitor.service", "workspace-save.timer"]
+gsettings = "payload/workspace/gsettings.json"
+
+[component.agents]
+summary = "Agent pairs (the relay), plus the Claude Code and Codex integration settings"
+requires = ["workspace"]
+commands = ["claude", "codex"]
+
+# Opt-in permission policies. Without one, the target's own policy stays as it is.
+[component.agents.presets]
+full-access = "payload/agents/policy/full-access.json"
+
+[component.memory]
+summary = "Empty shared memory for Claude Code and Codex, the ai-memory helper and local snapshots"
+requires = []
+apt = ["git", "python3"]
+units = ["ai-memory-snapshot.timer"]
+
+[component.clipboard]
+summary = "Super+V clipboard list, kept in memory only"
+requires = []
+apt = ["libglib2.0-bin"]
+extension = "clipboard-list@linux-terminal-agents-workbench"
+settings-schema = "org.gnome.shell.extensions.clipboard-list"
+gsettings = "payload/clipboard/gsettings.json"
+
+[component.gnome-look]
+summary = "Dark Yaru blue style and a bottom dock"
+requires = []
+apt = ["yaru-theme-gtk", "yaru-theme-icon"]
+gsettings = "payload/gnome-look/gsettings.json"

@@ -1,0 +1,6 @@
+#!/bin/bash
+# Files app: right-click -> Scripts -> Open Workspace Here.
+# Uses the selected folder if one is selected, otherwise the folder you're in.
+sel="$(printf '%s\n' "$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS" | head -n1)"
+if [ -n "$sel" ] && [ -d "$sel" ]; then dir="$sel"; else dir="$PWD"; fi
+exec "$HOME/.local/bin/work" "$dir"

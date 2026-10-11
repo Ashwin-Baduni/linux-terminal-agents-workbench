@@ -1,0 +1,6 @@
+# Private per-folder memory links (see templates/memory/README.md); never commit them.
+.ai-memory
+.claude/settings.local.json
+
+__pycache__/
+*.pyc

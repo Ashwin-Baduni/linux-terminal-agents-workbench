@@ -1,0 +1,28 @@
+# Narrow "Directory" sidebar used by the `work` workspace: a single list like VS
+# Code's explorer. Double-click opens files in their normal app (Markdown in
+# the Markdown Viewer, code in Text Editor, images, PDFs, HTML in the browser).
+
+[mgr]
+ratio = [0, 1, 0]
+sort_dir_first = true
+linemode = "none"
+
+[opener]
+app = [
+	{ run = "xdg-open %s1", orphan = true, desc = "Open in its app", for = "linux" },
+]
+
+[open]
+prepend_rules = [
+	{ url = "*", use = [ "app" ] },
+]
+
+[[plugin.prepend_fetchers]]
+url = "*"
+run = "git"
+group = "git"
+
+[[plugin.prepend_fetchers]]
+url = "*/"
+run = "git"
+group = "git"

@@ -1,0 +1,9 @@
+#!/bin/bash
+# Show a Markdown file formatted (glow) in its own Ghostty window.
+# Scroll with the mouse wheel; close with the window's X (or q).
+# Uses glow's pager mode: its full-screen viewer (-t) goes blank when the
+# window is resized (glow 2.1.1 bug).
+file="$(realpath -- "$1")"
+PAGER='less -R --mouse --wheel-lines=3' exec ghostty --confirm-close-surface=false \
+	--title="$(basename -- "$file")" --working-directory="$(dirname -- "$file")" \
+	-e glow -p -- "$file"

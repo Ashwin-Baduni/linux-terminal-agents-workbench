@@ -1,0 +1,36 @@
+# Ghostty config. Reload after editing with Ctrl+Shift+,
+# All options: ghostty +show-config --default --docs | less
+
+# --- Font -----------------------------------------------------------------
+font-family = JetBrains Mono
+font-size = 10
+# Extra line spacing makes long replies easier to read.
+adjust-cell-height = 15%
+
+# --- Colours: AMOLED black (themes/amoled-black) ---------------------------
+theme = amoled-black
+background-opacity = 1
+# Paint the title bar with the terminal's black instead of GNOME's grey.
+window-theme = ghostty
+
+# --- Window ---------------------------------------------------------------
+window-padding-x = 12
+window-padding-y = 8
+window-padding-balance = true
+
+# --- Cursor & mouse -------------------------------------------------------
+cursor-style = bar
+mouse-hide-while-typing = true
+# Keep wheel movement small enough to read without skipping text.
+mouse-scroll-multiplier = 1
+
+# --- Clipboard ------------------------------------------------------------
+# Selecting text copies it to the normal clipboard, so Ctrl+V works anywhere.
+copy-on-select = clipboard
+# Agent applications may handle their own mouse events; their menus are supplied
+# by tmux. Normal Ghostty surfaces always use the native context menu.
+right-click-action = context-menu
+
+# --- Keys -----------------------------------------------------------------
+# Close only the focused split (default closes the whole tab, Claude included).
+keybind = ctrl+shift+w=close_surface

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Workspace
+Comment=Open recent projects, reopen agents, and manage terminal workspaces
+Exec=@HOME@/.local/bin/work --pick
+Icon=@HOME@/.local/share/icons/hicolor/scalable/apps/work-layout.svg
+Terminal=false
+Categories=Development;

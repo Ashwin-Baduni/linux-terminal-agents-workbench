@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Workspace: a Directory panel beside two terminal (agent) panes.
+       Folder and prompt glyphs from Tabler Icons (MIT); colours Catppuccin Mocha. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#89b4fa"/>
+      <stop offset="1" stop-color="#5a7fd6"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#tile)"/>
+  <g fill="#11111b">
+    <rect x="36" y="40" width="56" height="176" rx="14"/>
+    <rect x="100" y="40" width="58" height="176" rx="14"/>
+    <rect x="166" y="40" width="54" height="176" rx="14"/>
+  </g>
+  <!-- Directory: folder + file list -->
+  <path d="M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2" transform="translate(40 50) scale(2)"
+        fill="#f9e2af" stroke="#f9e2af" stroke-width="1.6" stroke-linejoin="round"/>
+  <g stroke="#9399b2" stroke-width="9" stroke-linecap="round">
+    <line x1="52" y1="120" x2="76" y2="120"/>
+    <line x1="52" y1="146" x2="70" y2="146"/>
+    <line x1="52" y1="172" x2="76" y2="172"/>
+  </g>
+  <!-- Agent panes: terminal prompts -->
+  <g fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 9l3 3l-3 3M13 15l3 0" transform="translate(87 36) scale(3)" stroke="#a6e3a1"/>
+    <path d="M8 9l3 3l-3 3M13 15l3 0" transform="translate(151 36) scale(3)" stroke="#f5c2e7"/>
+  </g>
+  <g stroke="#585b70" stroke-width="9" stroke-linecap="round">
+    <line x1="114" y1="130" x2="142" y2="130"/><line x1="114" y1="156" x2="134" y2="156"/>
+    <line x1="180" y1="130" x2="206" y2="130"/><line x1="180" y1="156" x2="198" y2="156"/>
+  </g>
+</svg>

@@ -1,0 +1,9 @@
+$include /etc/inputrc
+
+# Ghostty sends a distinct code for Shift+Enter / Ctrl+Enter. Plain bash doesn't
+# understand it and prints ";2;13~", so treat both like Enter at the shell.
+# (Inside Claude Code, Shift+Enter still inserts a new line.)
+"\e[27;2;13~": accept-line
+"\e[27;5;13~": accept-line
+"\e[13;2u": accept-line
+"\e[13;5u": accept-line

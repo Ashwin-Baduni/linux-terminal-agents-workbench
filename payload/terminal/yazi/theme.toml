@@ -1,0 +1,4 @@
+# Code previews use Catppuccin Mocha (background changed to pure black),
+# matching the terminal, glow and bat.
+[mgr]
+syntect_theme = "@HOME@/.config/yazi/Catppuccin-Mocha.tmTheme"
