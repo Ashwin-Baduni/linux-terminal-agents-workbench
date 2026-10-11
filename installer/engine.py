@@ -273,7 +273,9 @@ class Run:
                 versions[agent.name] = {'path': found, 'version': version, 'installed': True,
                                         'release': agent.version, 'installer': agent.installer}
             elif found:
-                versions[agent.name] = {'path': found, 'version': packages.version_of(found), 'installed': False}
+                # Files-only modes may locate a CLI for rendered paths, but must never run it.
+                version = packages.version_of(found) if self.options.agents else None
+                versions[agent.name] = {'path': found, 'version': version, 'installed': False}
         return versions
 
     def record(self, versions):
@@ -288,7 +290,8 @@ class Run:
             self.record(versions)
         changed = {c.path for c in plan.changes}
         for name, info in versions.items():
-            log(f'{name}: {info["version"]} at {info["path"]}' + (' (installed now)' if info['installed'] else ''))
+            version = info['version'] or 'present; not run (files only)'
+            log(f'{name}: {version} at {info["path"]}' + (' (installed now)' if info['installed'] else ''))
         notes = []
         if not self.options.real:
             notes.append(f'Staged into {self.home.root}; nothing else on this system was changed.')

@@ -1,6 +1,6 @@
 # Verification record — 2026-10-11
 
-The installer and desktop rehearsal below used the code in `78f08a8`. Later handoff documentation does not change that code. The source machine's terminal, desktop, agent accounts and memory were not modified by installation tests.
+The desktop rehearsal below used the code in `78f08a8`. A subsequent review fix prevents files-only installations from executing existing agent CLIs; two regression tests cover staging and `--no-activate`, including executable side effects and unchanged binary contents. The automated results below include that fix. The source machine's terminal, desktop, agent accounts and memory were not modified by installation tests.
 
 ## Automated checks
 
@@ -8,7 +8,7 @@ The installer and desktop rehearsal below used the code in `78f08a8`. Later hand
 |---|---|
 | Repository and manifest | 29 passed |
 | Publication scanner regressions | 11 passed |
-| Installer and recovery | 63 passed, including the online vendor-interface check |
+| Installer and recovery | 65 passed, including the online vendor-interface check |
 | Shared memory | 32 passed |
 | Copy everything | 12 passed |
 | Workspace scenarios | 9 passed |
@@ -16,7 +16,7 @@ The installer and desktop rehearsal below used the code in `78f08a8`. Later hand
 
 The final quick run used `WORKBENCH_ONLINE=1 tests/run.py --quick`. Without that variable, one installer test is skipped. That test downloads the official installation scripts and checks their interfaces without executing them. All normal suites install this checkout into scratch homes; they do not test against a contributor's live files.
 
-The relay suite was run at `03c5d86`. Its source, workspace integration and test harness are unchanged in `78f08a8`. It uses local stand-ins for agent processes and exercises delivery, retries, recovery and termination without paid model calls.
+The relay suite was run at `03c5d86`. Its source, workspace integration and test harness remain unchanged through the final files-only installer fix. It uses local stand-ins for agent processes and exercises delivery, retries, recovery and termination without paid model calls.
 
 Publication checks covered the working tree, every reachable commit and commit identity, with additional private-name patterns kept outside the repository. Commit identities use GitHub noreply addresses. A scan supplements inspection of the source and staged diff; it cannot prove that arbitrary text is non-sensitive.
 

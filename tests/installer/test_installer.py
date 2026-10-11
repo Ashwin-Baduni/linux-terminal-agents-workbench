@@ -25,6 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import support  # noqa: E402
 from installer import merges, packages, preflight, transaction  # noqa: E402
+from installer import cli as cli_module  # noqa: E402
 from installer import plan as plan_module  # noqa: E402
 from installer.desktop import Desktop  # noqa: E402
 from installer.engine import Options, Refused, Run, resolve_values, rollback  # noqa: E402
@@ -106,6 +107,47 @@ class Scratch(unittest.TestCase):
 
 
 class Staging(Scratch):
+    def broken_agents(self):
+        binaries = {}
+        for name in ('claude', 'codex'):
+            marker = self.root / f'{name}-executed'
+            body = f'#!/bin/sh\n: > "{marker}"\nexit 139\n'
+            binaries[name] = (self.write(f'.local/bin/{name}', body, 0o755), marker, body)
+        return binaries
+
+    def assertAgentsNotRun(self, binaries):
+        for binary, marker, body in binaries.values():
+            self.assertFalse(marker.exists(), f'{binary} was executed')
+            self.assertEqual(binary.read_text(), body)
+        self.assertTrue((self.home / '.local/bin/workspace-control').is_file())
+        journal = json.loads((self.backups()[-1] / 'journal.json').read_text())
+        for name, (binary, _, _) in binaries.items():
+            self.assertEqual(journal['agents'][name],
+                             {'path': str(binary), 'version': None, 'installed': False})
+        self.assertNothingTrapped()
+
+    def test_staging_does_not_execute_existing_agent_binaries(self):
+        binaries = self.broken_agents()
+        self.cli('--check')
+        self.assertIn('present; not run (files only)', self.cli('--install').stdout)
+        self.assertAgentsNotRun(binaries)
+        self.cli('--install')   # repeated staging must not execute them either
+        self.assertAgentsNotRun(binaries)
+
+    def test_no_activate_does_not_execute_existing_agent_binaries(self):
+        binaries = self.broken_agents()
+        # Exercise the real CLI's --no-activate path, but all writes still go to the scratch home.
+        with mock.patch.object(pwd, 'getpwuid', return_value=mock.Mock(pw_dir=str(self.home))), \
+                mock.patch.object(Run, 'platform_problems', return_value=[]), \
+                mock.patch.object(Desktop, 'unit_state', return_value={'enabled': 'not-found', 'active': 'inactive'}), \
+                mock.patch.dict(os.environ, dict(self.env, HOME=str(self.home))), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli_module.main(['--install', '--no-activate']), 0)
+        self.assertIn('present; not run (files only)', out.getvalue())
+        self.assertAgentsNotRun(binaries)
+        record = json.loads(self.read('.local/state/workbench/installed.json'))
+        self.assertTrue(all(info['version'] is None for info in record['agents'].values()))
+
     def test_check_changes_nothing(self):
         before = snapshot(self.home)
         out = self.cli('--check').stdout
