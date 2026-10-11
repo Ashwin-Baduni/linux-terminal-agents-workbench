@@ -4,7 +4,7 @@ Open **Workspace** from the applications menu or dock. In Files, right-click a p
 
 Each workspace starts with two terminal panes. Click a pane to focus it and drag a border to resize it. Right-click for **Agents…**, **Pair two agents…**, **Project / review…** and **Layout / output / resources…**. **Show Directory** adds the file browser when you need it.
 
-Sign in to Claude Code and Codex before starting a pair. Pairing connects an orchestrator and a coder. The orchestrator's final replies become the coder's instructions, and the coder's replies return to the orchestrator. The relay keeps one message in flight. Use **Pair controls…** to manage a running pair; a final line containing `PAIR-DONE` ends the relay. Unpair before starting a different Codex conversation with `/new` or `/resume`.
+Sign in to Claude Code and Codex before starting a pair. Pairing connects an orchestrator and a coder. The orchestrator's final replies become the coder's instructions, and the coder's replies return to the orchestrator. The relay keeps one message in flight. Use **Pair controls…** to manage a running pair. The relay ends when the orchestrator finishes a reply with a line that says only `PAIR-DONE`; the coder cannot end it. Unpair before starting a different Codex conversation with `/new` or `/resume`.
 
 **Copy everything** copies the available conversation or terminal history. The right-click menu also provides paste, pane splitting and opening file paths. Ordinary agent tabs get the mouse menu too when started through the installed shell wrappers.
 

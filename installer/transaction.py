@@ -30,6 +30,20 @@ class Interrupted(RuntimeError):
     pass
 
 
+class RollbackIncomplete(RuntimeError):
+    """A rollback stopped partway; its journal records what was restored, and it can be run again."""
+    def __init__(self, folder, restored, error):
+        super().__init__(f'The rollback stopped partway ({error}). Restored so far: '
+                         + (', '.join(restored) if restored else 'nothing')
+                         + f'. Fix the cause, then run ./install.sh --rollback {folder} again; '
+                         'it continues from where it stopped.')
+        self.restored = restored
+
+
+# Journals in these states leave the home between two known states; nothing new may start.
+UNFINISHED = ('applying', 'failed', 'rolling-back', 'rollback-failed')
+
+
 @contextlib.contextmanager
 def install_lock(home):
     """One installer or rollback at a time for a home."""
@@ -63,7 +77,7 @@ def journals(home):
 
 
 def unfinished(home):
-    return [(path, journal) for path, journal in journals(home) if journal.get('status') in ('applying', 'failed')]
+    return [(path, journal) for path, journal in journals(home) if journal.get('status') in UNFINISHED]
 
 
 class Transaction:
@@ -211,7 +225,7 @@ def _setting(desktop, step, plan):
         plan.problems.append(f'{name} changed after installation (now {current})')
 
 
-def _unit(desktop, step, plan, partial=False):
+def _unit(desktop, step, plan, partial=False, retrying=False):
     unit, before, after = step['unit'], step['before'], step['after']
     current = desktop.unit_state(unit)
     action = {'unit': unit, 'stop': False, 'disable': False, 'restart': False,
@@ -228,7 +242,8 @@ def _unit(desktop, step, plan, partial=False):
     elif after.get('restart'):
         if current['active'] in RUNNING:
             action['restart'] = True
-        elif partial:
+        elif partial or retrying:
+            # The installation's own restart (or an earlier rollback's) left it stopped.
             action['start'] = True
         else:
             plan.left.append(f'service {unit} (stopped since installing; left stopped)')
@@ -242,7 +257,8 @@ def preflight(home, journal, desktop):
     done = journal.get('done', [])
     numbers = list(done)
     # An interrupted or failed run may have finished part or all of the step it was on.
-    in_flight = len(done) if journal.get('status') != 'complete' and len(done) < len(journal['steps']) else None
+    finished = journal.get('status') == 'complete' or journal.get('applied') == 'complete'
+    in_flight = len(done) if not finished and len(done) < len(journal['steps']) else None
     if in_flight is not None:
         numbers.append(in_flight)
     for number in reversed(numbers):
@@ -254,16 +270,16 @@ def preflight(home, journal, desktop):
         elif step['type'] == 'gsetting':
             _setting(desktop, step, plan)
         elif step['type'] == 'unit':
-            _unit(desktop, step, plan, number == in_flight)
+            _unit(desktop, step, plan, number == in_flight, journal.get('status') in ('rolling-back', 'rollback-failed'))
     return plan
 
 
-def restore(home, journal, desktop, automatic=False, keep_changed=False):
+def restore(home, journal, desktop, automatic=False, keep_changed=False, progress=None):
     """Undo a transaction: services stop first, then files and settings return, then services restart.
 
     Refuses (RollbackRefused) when something changed after installation, unless keep_changed
     leaves those changes in place; an automatic recovery after a failure also leaves them and
-    reports them as problems.
+    reports them as problems. progress(item) is called after each item is restored.
     """
     plan = preflight(home, journal, desktop)
     if plan.problems and not (automatic or keep_changed):
@@ -290,9 +306,11 @@ def restore(home, journal, desktop, automatic=False, keep_changed=False):
         elif before.kind == 'symlink':
             home.symlink(step['path'], before.link)
         plan.restored.append(f'~/{step["path"]}')
+        progress and progress(plan.restored[-1])
     for step in plan.settings:
         desktop.set_value(step['schema'], step['key'], step['before'])
         plan.restored.append(f'{step["schema"]} {step["key"]}')
+        progress and progress(plan.restored[-1])
     if plan.units:
         desktop.reload(force=True)                # read the restored unit files
         for action in plan.units:
@@ -303,6 +321,7 @@ def restore(home, journal, desktop, automatic=False, keep_changed=False):
             if action['restart']:
                 desktop.command('systemctl', '--user', 'try-restart', action['unit'], check=True)
             plan.restored.append(action['unit'])
+            progress and progress(plan.restored[-1])
     return plan
 
 
@@ -326,19 +345,56 @@ def rollback(home, folder, desktop=None, keep_changed=False):
     rel, journal = load_journal(home, folder)
     if journal.get('status') == 'rolled-back':
         return Recovery(left=['this installation was already rolled back'])
-    outcome = restore(home, journal, desktop, keep_changed=keep_changed)
+
+    def save():
+        home.write(rel / 'journal.json', (json.dumps(journal, indent=2) + '\n').encode(), 0o600)
+
+    previous = journal.get('status')
+    # The installation's own outcome stays readable after the status moves on.
+    if previous in ('complete', 'applying', 'failed'):
+        journal['applied'] = previous
+    attempt = {'started': datetime.now(timezone.utc).isoformat(), 'restored': [], 'keep_changed': keep_changed}
+    journal.setdefault('rollbacks', []).append(attempt)
+    try:
+        # Refusals are decided before anything changes, and leave the journal as it was.
+        if not keep_changed:
+            problems = preflight(home, journal, desktop).problems
+            if problems:
+                journal['rollbacks'].pop()
+                raise RollbackRefused(problems)
+        journal['status'] = 'rolling-back'
+        save()
+
+        def progress(item):
+            attempt['restored'].append(item)
+            save()
+
+        outcome = restore(home, journal, desktop, keep_changed=keep_changed, progress=progress)
+    except RollbackRefused:
+        if journal.get('status') == 'rolling-back':     # something changed after the check; nothing was restored
+            journal['status'] = previous
+            journal['rollbacks'].pop()
+            save()
+        raise
+    except BaseException as error:
+        journal['status'] = 'rollback-failed'
+        attempt['error'] = f'{type(error).__name__}: {error}'
+        save()
+        raise RollbackIncomplete(home.root / rel, attempt['restored'], attempt['error']) from error
     journal['status'] = 'rolled-back'
     journal['rolled_back'] = datetime.now(timezone.utc).isoformat()
+    attempt['kept'] = outcome.left
     journal['rollback'] = {'restored': outcome.restored, 'kept': outcome.left}
-    home.write(rel / 'journal.json', (json.dumps(journal, indent=2) + '\n').encode(), 0o600)
+    save()
     return outcome
 
 
 def latest(home):
-    found = [path for path, journal in journals(home) if journal.get('status') in ('applying', 'failed', 'complete')]
+    found = [path for path, journal in journals(home) if journal.get('status') in UNFINISHED + ('complete',)]
     if not found:
         raise RollbackRefused(['there is no installation to roll back'])
     return found[-1]
 
 
-__all__ = ['Home', 'Transaction', 'rollback', 'latest', 'unfinished', 'install_lock', 'RollbackRefused', 'Interrupted']
+__all__ = ['Home', 'Transaction', 'rollback', 'latest', 'unfinished', 'install_lock', 'RollbackRefused', 'Interrupted',
+           'RollbackIncomplete']

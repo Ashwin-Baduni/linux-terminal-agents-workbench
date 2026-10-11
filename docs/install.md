@@ -56,9 +56,10 @@ Nothing is overwritten without a backup. The plan names every file before anythi
 - **`~/.claude/CLAUDE.md`** gets the shared-memory import unless it is already there.
 - **`~/.codex/AGENTS.md`** becomes a link to the shared memory when you have none. If you already have one, it keeps your instructions and gains a short block that tells Codex to read the shared memory. `AGENTS.override.md` gets the same block, because Codex reads it first.
 - **`~/ai-memory`**: an existing memory is never touched. A new one starts with the rules and empty indexes.
-- **Symlinks:** a symlink where a file goes is replaced by the file, and the file it pointed to is left alone. A symlinked folder is followed only when it stays inside your home. The installer refuses one that leads elsewhere.
+- **Symlinks:** a symlink where a file goes is replaced by the file, and the file it pointed to is left alone. A symlinked folder is followed only when it stays inside your home. The installer refuses one that leads elsewhere. The links it creates are worked out from where their folder really is, so they still work inside a symlinked `~/.codex` or `~/.config/yazi-sidebar`.
+- **Masked services:** a unit you masked (its file in `~/.config/systemd/user` links to `/dev/null`) keeps its mask. So does one masked for every user in `/etc/systemd/user` or `/run/systemd/user`, or one that systemd reports as masked. The installer installs no unit file for it, and does not enable or start it. It names the unit at the end.
 
-`CODEX_HOME` and `CLAUDE_CONFIG_DIR` are honoured when they point inside your home.
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR` are honoured when they point inside your home. If you use either one, set it for the whole desktop session, not only in `~/.bashrc`. The workspace, its menus and its monitor service start outside your shell, and they would otherwise read the default folders. Put the variable in a file such as `~/.config/environment.d/agents.conf`, for example `CODEX_HOME=$HOME/.config/codex`, then log out and back in. The installer only points out a mismatch. It never changes the session environment itself.
 
 ## Claude Code and Codex
 
@@ -107,6 +108,8 @@ If an installation fails, it undoes what it had done at once. That includes a st
 
 If an installation is killed partway, the next run also refuses to continue until you run `--rollback` on it. That rollback covers the step the installation was on, too.
 
+A rollback writes its own progress into the journal as it goes. If it stops partway, because a service fails to restart or the rollback is interrupted, the journal says so and lists what was already restored. The installer then refuses to install again until you run the same `--rollback` once more. That run continues from where the last one stopped, and it starts a service an earlier attempt left stopped.
+
 ## Trying it without touching your setup
 
 ```bash
@@ -121,6 +124,7 @@ This writes and merges files inside `/tmp/try-home` only. It installs no package
 
 - Only the tested Ubuntu, GNOME and Wayland versions are accepted for a real installation.
 - The home path must not contain spaces or shell characters, because it is written into desktop entries and configuration files.
+- Planning does not need Git: without it, the installer reads `core.excludesFile` straight from your Git configuration files. Git `include` directives are not followed in that case. Once Git has been installed, the plan is made again with Git itself.
 - Before installing any package or agent CLI, the installer works out every file change. A broken settings file or an unsafe symlink therefore stops it before anything else happens.
 - Fresh-desktop behaviour has to be rehearsed on a disposable Ubuntu 26.04 machine: the GNOME session, glyphs, the clipboard extension after login, and the real agent installers and sign-ins. The automated tests use stand-ins for the desktop, services and vendor installers.
 - Hide Top Bar, display tuning and other personal machine settings are not included.

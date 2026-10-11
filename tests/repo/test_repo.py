@@ -242,6 +242,12 @@ class MemoryTemplates(unittest.TestCase):
 
 
 class AgentProfiles(unittest.TestCase):
+    def test_workspace_sessions_receive_the_agent_folders(self):
+        conf = (REPO / 'payload/workspace/tmux/workspace.conf').read_text()
+        names = next(line for line in conf.splitlines() if line.startswith('set -g update-environment')).split("'")[1].split()
+        self.assertIn('CODEX_HOME', names)
+        self.assertIn('CLAUDE_CONFIG_DIR', names)
+
     def test_runtime_readers_follow_the_installed_agent_profile(self):
         root = scratch(self)
         codex = root / 'custom-codex'

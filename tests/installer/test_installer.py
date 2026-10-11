@@ -25,6 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import support  # noqa: E402
 from installer import merges, packages, preflight, transaction  # noqa: E402
+from installer import plan as plan_module  # noqa: E402
 from installer.desktop import Desktop  # noqa: E402
 from installer.engine import Options, Refused, Run, resolve_values, rollback  # noqa: E402
 from installer.fsops import Home, Unsafe  # noqa: E402
@@ -197,6 +198,65 @@ class Safety(Scratch):
         self.assertFalse((self.home / '.config/ghostty/config').is_symlink())
         self.cli('--rollback', 'last')
         self.assertEqual(os.readlink(self.home / '.config/ghostty/config'), str(outside))
+
+    def test_links_in_symlinked_folders_reach_their_targets(self):
+        (self.home / 'dotfiles/codex').mkdir(parents=True)
+        (self.home / 'dotfiles/yazi-sidebar').mkdir(parents=True)
+        (self.home / '.codex').symlink_to('dotfiles/codex')
+        (self.home / '.config').mkdir()
+        (self.home / '.config/yazi-sidebar').symlink_to('../dotfiles/yazi-sidebar')
+        self.cli('--install')
+        home = self.home.resolve()
+        self.assertEqual((self.home / '.codex/AGENTS.md').resolve(), home / 'ai-memory/MEMORY.md')
+        self.assertEqual((self.home / '.config/yazi-sidebar/theme.toml').resolve(), home / '.config/yazi/theme.toml')
+        installed = snapshot(self.home)
+        self.assertIn('nothing was changed', self.cli('--install').stdout)
+        self.assertEqual(snapshot(self.home), installed)
+        self.cli('--rollback', 'last')
+        self.assertEqual(sorted(p.name for p in (self.home / 'dotfiles/codex').iterdir()), [])
+
+    def test_staged_links_in_symlinked_folders_reach_their_targets(self):
+        (self.home / 'dotfiles/yazi-sidebar').mkdir(parents=True)
+        (self.home / '.config').mkdir()
+        (self.home / '.config/yazi-sidebar').symlink_to('../dotfiles/yazi-sidebar')
+        stage(self.home, ['workspace'])
+        self.assertEqual((self.home / '.config/yazi-sidebar/theme.toml').resolve(),
+                         self.home.resolve() / '.config/yazi/theme.toml')
+
+    def test_planning_works_without_git_and_reads_its_config(self):
+        bin_dir = self.root / 'no-git'
+        bin_dir.mkdir()
+        for tool in ('python3', 'sh', 'dirname', 'glib-compile-schemas'):
+            (bin_dir / tool).symlink_to(shutil.which(tool))
+        self.write('.gitconfig', '[user]\n\tname = x\n[core]\n\texcludesFile = "~/my-ignore" ; ours\n')
+        result = subprocess.run([INSTALL, '--install', '--only', 'memory', '--target-home', str(self.home)],
+                                env=dict(self.env, PATH=str(bin_dir)), capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('git is not installed yet', result.stdout)
+        self.assertEqual(self.read('my-ignore'), '.ai-memory\n**/.claude/settings.local.json\n')
+        self.assertFalse((self.home / '.config/git/ignore').exists())
+        self.assertIn('nothing was changed', self.cli('--install', '--only', 'memory').stdout)   # git agrees
+
+    def test_a_user_masked_unit_stays_masked(self):
+        units = self.home / '.config/systemd/user'
+        units.mkdir(parents=True)
+        (units / 'workspace-save.timer').symlink_to(os.devnull)
+        out = self.cli('--install', '--only', 'workspace').stdout
+        self.assertIn('workspace-save.timer is masked', out)
+        self.assertEqual(os.readlink(units / 'workspace-save.timer'), os.devnull)
+        self.assertTrue((units / 'workspace-save.service').is_file())
+        self.assertIn('nothing was changed', self.cli('--install', '--only', 'workspace').stdout)
+
+    def test_a_system_mask_is_not_overridden(self):
+        system = self.root / 'etc-systemd-user'
+        system.mkdir()
+        (system / 'workspace-monitor.service').symlink_to(os.devnull)
+        context = Context(home=Home(self.home), values=resolve_values(self.home.resolve(), False), real=True, env={})
+        with mock.patch.object(plan_module, 'SYSTEM_UNIT_DIRS', (system,)):
+            plan = build(load(), context, ['workspace'])
+        self.assertNotIn('.config/systemd/user/workspace-monitor.service', {c.path for c in plan.changes})
+        self.assertEqual(plan.masked, {'workspace-monitor.service'})
+        self.assertTrue(any('masked for every user' in note for note in plan.notes))
 
     def test_rollback_refuses_a_folder_symlink_added_later(self):
         self.cli('--install', '--only', 'terminal')
@@ -428,6 +488,37 @@ Run(Options(home=Path({str(self.home)!r}), real=False), log=lambda *a: None).ins
             Run(Options(home=self.home, real=False, packages=True), log=lambda *a: None).install()
         self.assertEqual(calls, [])
 
+    def test_an_interrupted_rollback_is_finished_by_the_next_one(self):
+        Preservation.populate(self)
+        before = snapshot(self.home)
+        self.cli('--install')
+        script = f'''
+import os, sys
+sys.path.insert(0, {str(REPO)!r})
+from pathlib import Path
+from installer import transaction
+from installer.engine import Options, rollback
+original = transaction.restore
+def stop_partway(*args, progress=None, **kwargs):
+    count = [0]
+    def tracked(item):
+        progress(item)
+        count[0] += 1
+        if count[0] == 20:
+            os._exit(9)     # killed in the middle of the rollback
+    return original(*args, progress=tracked, **kwargs)
+transaction.restore = stop_partway
+rollback(Options(home=Path({str(self.home)!r}), real=False), 'last', log=lambda *a: None)
+'''
+        result = subprocess.run([sys.executable, '-c', script], env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 9, result.stderr)
+        journal = json.loads((self.backups()[-1] / 'journal.json').read_text())
+        self.assertEqual((journal['status'], len(journal['rollbacks'][-1]['restored'])), ('rolling-back', 20))
+        self.assertIn('installation or rollback did not finish', self.cli('--install', ok=False).stderr)
+        self.cli('--rollback', 'last')
+        self.assertEqual(snapshot(self.home), before)
+        self.assertEqual(json.loads((self.backups()[-1] / 'journal.json').read_text())['status'], 'rolled-back')
+
     def test_corrupt_backup_is_refused(self):
         Preservation.populate(self)
         self.cli('--install')
@@ -461,18 +552,40 @@ state.setdefault('log', []).append(' '.join(args))
 runtime = '--runtime' in args
 args = [a for a in args if a != '--runtime']
 units = state.setdefault('units', {})
+# Like systemd: a unit with no unit file anywhere is "not-found"; a unit file linked to /dev/null is masked.
+# Units seeded by a test stand for unit files elsewhere; units first touched here need their home file.
+folder = os.environ.get('FAKE_UNIT_DIR', '')
+def unit_file(name):
+    return os.path.join(folder, name) if folder else ''
+def has_file(name):
+    return bool(folder) and os.path.lexists(unit_file(name)) and os.path.realpath(unit_file(name)) != os.devnull
 if args[0] in ('is-enabled', 'is-active'):
-    unit = units.get(args[1], {'enabled': 'disabled', 'active': 'inactive'})
-    value = unit['enabled' if args[0] == 'is-enabled' else 'active']
+    name, unit = args[1], units.get(args[1])
+    masked = bool(folder) and os.path.islink(unit_file(name)) and os.path.realpath(unit_file(name)) == os.devnull
+    found = not (unit is None and not has_file(name) or unit is not None and unit.get('home_file') and not has_file(name))
+    if args[0] == 'is-enabled':
+        value = 'masked' if masked else (unit or {}).get('enabled', 'disabled') if found else 'not-found'
+    else:
+        value = (unit or {}).get('active', 'inactive') if found else 'inactive'
     print(value)
     json.dump(state, open(path, 'w'))
-    sys.exit(0 if value in ('enabled', 'active') else 1)
-if args[0] in ('restart', 'try-restart') and os.environ.get('FAKE_WATCH'):
-    state.setdefault('seen', []).append(open(os.environ['FAKE_WATCH']).read())
+    sys.exit(0 if value in ('enabled', 'enabled-runtime', 'static', 'active') else 4 if not found else 1)
+if args[0] in ('enable', 'start', 'restart') and args[1] not in units and not has_file(args[1]):
+    print(f'Unit file {args[1]} does not exist.', file=sys.stderr)
+    sys.exit(1)
+if ' '.join(args) in state.get('fail', []):
+    if args[0] in ('restart', 'try-restart', 'start'):
+        units.setdefault(args[1], {})['active'] = 'failed'
+    json.dump(state, open(path, 'w'))
+    sys.exit(1)
+if args[0] in ('restart', 'try-restart', 'start') and os.path.exists(os.environ.get('FAKE_WATCH', '')):
+    state.setdefault('seen', []).append(open(os.environ['FAKE_WATCH']).read())   # what the service would run
 if args[0] == 'try-restart':
     args[0] = 'restart' if units.get(args[1], {}).get('active') == 'active' else 'noop'
 if args[0] in ('enable', 'disable', 'start', 'stop', 'restart'):
-    unit = units.setdefault(args[1], {'enabled': 'disabled', 'active': 'inactive'})
+    if args[1] not in units:     # first known through its unit file in the home
+        units[args[1]] = {'enabled': 'disabled', 'active': 'inactive', 'home_file': has_file(args[1])}
+    unit = units[args[1]]
     if args[0] in ('enable', 'disable'):
         unit['enabled'] = 'enabled-runtime' if args[0] == 'enable' and runtime else args[0] + 'd'
     else:
@@ -507,7 +620,8 @@ class DesktopIntegration(Scratch):
         self.units = self.root / 'systemctl.json'
         self.units.write_text('{}')
         self.fake_env = dict(os.environ, PATH=f'{fakes}:{os.environ["PATH"]}', FAKE_GSETTINGS=str(self.settings),
-                             FAKE_SYSTEMCTL=str(self.units), FAKE_WATCH=str(self.home / '.local/share/workspace/workspace.py'))
+                             FAKE_SYSTEMCTL=str(self.units), FAKE_WATCH=str(self.home / '.local/share/workspace/workspace.py'),
+                             FAKE_UNIT_DIR=str(self.home / '.config/systemd/user'))
         self.desktop = Desktop(env=self.fake_env)
         legacy = self.home / '.local/share/gnome-shell/extensions/old-clipboard@example'
         legacy.mkdir(parents=True)
@@ -531,15 +645,15 @@ class DesktopIntegration(Scratch):
         self.assertEqual(self.value('org.gnome.settings-daemon.plugins.media-keys terminal'),
                          "['<Primary><Alt>t', '<Super>t']")
         self.assertEqual(self.value('org.gnome.desktop.interface color-scheme'), "'prefer-dark'")
-        units = json.loads(self.units.read_text())['units']
         for unit in ('workspace-monitor.service', 'workspace-save.timer', 'ai-memory-snapshot.timer'):
-            self.assertEqual(units[unit], {'enabled': 'enabled', 'active': 'active'}, unit)
+            self.assertEqual(self.unit(unit), {'enabled': 'enabled', 'active': 'active'}, unit)
         with contextlib.redirect_stdout(io.StringIO()):
             rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop)
         self.assertEqual(json.loads(self.settings.read_text()), INITIAL_SETTINGS)
-        units = json.loads(self.units.read_text())['units']
         for unit in ('workspace-monitor.service', 'workspace-save.timer', 'ai-memory-snapshot.timer'):
-            self.assertEqual(units[unit], {'enabled': 'disabled', 'active': 'inactive'}, unit)
+            self.assertEqual(self.unit(unit), {'enabled': 'disabled', 'active': 'inactive'}, unit)
+            # Its unit file is gone again, so systemd no longer knows it, as before the installation.
+            self.assertEqual(self.systemd(unit), {'enabled': 'not-found', 'active': 'inactive'}, unit)
 
     def test_rollback_refuses_a_setting_changed_later(self):
         self.run_install()
@@ -571,7 +685,17 @@ class DesktopIntegration(Scratch):
         self.assertIn('10min', timer.read_text())
 
     def unit(self, name):
-        return json.loads(self.units.read_text()).get('units', {}).get(name)
+        unit = json.loads(self.units.read_text()).get('units', {}).get(name)
+        return None if unit is None else {k: v for k, v in unit.items() if k != 'home_file'}
+
+    def unit_file(self, name):
+        path = self.home / '.config/systemd/user' / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('[Unit]\nDescription=test\n')
+
+    def systemd(self, name):
+        """What systemctl reports for a unit now (enablement, activity)."""
+        return self.desktop.unit_state(name)
 
     def test_a_setting_changed_by_a_failing_step_is_undone(self):
         class Flaky(Desktop):
@@ -597,6 +721,7 @@ class DesktopIntegration(Scratch):
                 self.command('systemctl', '--user', 'enable', unit, check=True)
                 raise OSError('the service failed to start (simulated)')
         desktop = Flaky(env=self.fake_env)
+        self.unit_file('workspace-save.timer')
         steps = desktop.plan_units(['workspace-save.timer'])
         tx = transaction.Transaction(Home(self.home), Plan(home=self.home, components=[]), desktop)
         tx.prepare([], steps)
@@ -620,6 +745,7 @@ class DesktopIntegration(Scratch):
                 return super().command(*args, check=check)
 
         desktop = Flaky(env=self.fake_env)
+        self.unit_file('workspace-save.timer')
         tx = transaction.Transaction(Home(self.home), Plan(home=self.home, components=[]), desktop)
         tx.prepare([], desktop.plan_units(['workspace-save.timer']))
         with self.assertRaises(OSError):
@@ -673,6 +799,53 @@ class DesktopIntegration(Scratch):
         self.assertEqual(self.unit(unit)['enabled'], 'enabled')
         transaction.rollback(Home(self.home), folder, self.desktop)
         self.assertEqual(self.unit(unit), before)
+
+    def test_a_failed_rollback_is_journaled_and_can_be_retried(self):
+        old = self.home / '.local/share/workspace/workspace.py'
+        old.parent.mkdir(parents=True)
+        old.write_text('# the previous workspace code\n')
+        state = {'units': {'workspace-monitor.service': {'enabled': 'enabled', 'active': 'active'}}}
+        self.units.write_text(json.dumps(state))
+        self.run_install()
+        state = json.loads(self.units.read_text())
+        state['fail'] = ['try-restart workspace-monitor.service']
+        self.units.write_text(json.dumps(state))
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(transaction.RollbackIncomplete) as stopped:
+            rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop)
+        self.assertIn('~/.local/share/workspace/workspace.py', stopped.exception.restored)
+        journal = json.loads((self.backups()[-1] / 'journal.json').read_text())
+        self.assertEqual(journal['status'], 'rollback-failed')
+        self.assertIn('try-restart', journal['rollbacks'][-1]['error'])
+        self.assertIn('~/.local/share/workspace/workspace.py', journal['rollbacks'][-1]['restored'])
+        self.assertEqual(journal['applied'], 'complete')
+        self.assertTrue(transaction.unfinished(Home(self.home)))
+        with self.assertRaises(Refused):
+            self.run_install()
+        self.assertEqual(old.read_text(), '# the previous workspace code\n')
+        state = json.loads(self.units.read_text())
+        state['fail'] = []
+        self.units.write_text(json.dumps(state))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rollback(Options(home=self.home, real=False), 'last', desktop=self.desktop)
+        self.assertEqual(self.unit('workspace-monitor.service'), {'enabled': 'enabled', 'active': 'active'})
+        self.assertEqual(json.loads(self.units.read_text())['seen'][-1], '# the previous workspace code\n')
+        self.assertEqual(json.loads((self.backups()[-1] / 'journal.json').read_text())['status'], 'rolled-back')
+
+    def test_masked_units_are_not_enabled_or_started(self):
+        units = self.home / '.config/systemd/user'
+        units.mkdir(parents=True)
+        (units / 'workspace-save.timer').symlink_to(os.devnull)
+        out = self.run_install()
+        self.assertIn('workspace-save.timer is masked', out)
+        log = json.loads(self.units.read_text())['log']
+        self.assertFalse([line for line in log if 'workspace-save.timer' in line and not line.startswith('is-')], log)
+        self.assertEqual(self.systemd('workspace-save.timer')['enabled'], 'masked')
+        self.assertEqual(self.unit('workspace-monitor.service'), {'enabled': 'enabled', 'active': 'active'})
+
+    def test_agent_folders_set_only_in_the_terminal_are_pointed_out(self):
+        with mock.patch.dict(os.environ, {'CODEX_HOME': str(self.home / 'codex-elsewhere')}):
+            out = self.run_install()
+        self.assertIn('CODEX_HOME is set in this terminal but not for the whole desktop session', out)
 
     def test_a_service_changed_later_is_not_overwritten(self):
         self.run_install()

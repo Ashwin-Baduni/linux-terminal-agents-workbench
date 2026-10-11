@@ -13,6 +13,7 @@ import re
 
 from .fsops import Home
 from .manifest import load
+from .plan import link_target
 
 MARKER = '.workbench-stage.json'
 # Rendered paths go into desktop entries, tmux options and TOML strings unquoted.
@@ -45,7 +46,7 @@ def stage(home, components=None, manifest=None, values=None):
         if entry.kind == 'dir':
             target.mkdir(entry.target)
         elif entry.kind == 'link':
-            target.symlink(entry.target, entry.link)
+            target.symlink(entry.target, target.link_text(entry.target, link_target(entry.target, entry.link)))
         elif entry.kind == 'seed' and (state.kind != 'absent' or
                                        any(target.state(p).kind != 'absent' for p in entry.skip_if)):
             continue

@@ -245,6 +245,18 @@ class Home:
         finally:
             os.close(fd)
 
+    def link_text(self, rel, target):
+        """What a symlink at rel must contain to reach the home path target.
+
+        The system resolves a relative link from the folder the link really lives in, so
+        the text is computed from resolved folders: a symlinked ~/.codex or
+        ~/.config/yazi-sidebar still gets a link that reaches the intended file.
+        """
+        rel, target = relative(self.root, rel), relative(self.root, target)
+        here = self.root / real_parent(self.root, rel)
+        there = self.root / real_parent(self.root, target) / target.name
+        return os.path.relpath(there, here)
+
     def missing_folders(self, rel):
         """The folders a write to rel would create, outermost first (after resolving inside-home links)."""
         rel = relative(self.root, rel)

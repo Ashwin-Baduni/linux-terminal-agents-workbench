@@ -12,7 +12,7 @@ from . import packages, preflight
 from .desktop import Desktop, extensions_with_schema, refresh_caches
 from .fsops import Home, Unsafe
 from .manifest import load
-from .plan import Context, PlanError, build, describe
+from .plan import Context, PlanError, build, describe, masked_note
 from .stage import SAFE_HOME
 from .transaction import (STATE_DIR, RollbackRefused, Transaction, install_lock, latest, load_journal,
                           rollback as undo, unfinished)
@@ -125,12 +125,14 @@ class Run:
             return [], [], []
         settings, skipped = self.desktop.plan_settings(desktop_operations(self.manifest, self.chosen, self.home.root))
         changed = {c.path for c in plan.changes}
-        names = units_for(self.manifest, self.chosen)
+        names = [name for name in units_for(self.manifest, self.chosen) if name not in plan.masked]
         restart = {name for name in names if f'.config/systemd/user/{name}' in changed or
                    (name.endswith('.timer') and f'.config/systemd/user/{name[:-6]}.service' in changed)}
         if changed & {'.local/share/workspace/workspace.py', '.local/bin/workspace-control'}:
             restart.add('workspace-monitor.service')
         units = self.desktop.plan_units(names, restart)
+        for name in self.desktop.masked:
+            plan.notes.append(masked_note(name, 'systemd reports it as masked'))
         return settings, units, skipped
 
     # --- check ---------------------------------------------------------------
@@ -140,7 +142,7 @@ class Run:
         log('Components: ' + ', '.join(self.chosen))
         problems = self.platform_problems()
         for path, journal in unfinished(self.home):
-            log(f'An earlier installation did not finish: ./install.sh --rollback {path}')
+            log(f'An earlier installation or rollback did not finish: ./install.sh --rollback {path}')
         apt, snaps = self.missing()
         if apt:
             log('Ubuntu packages to install: ' + ' '.join(apt))
@@ -192,7 +194,7 @@ class Run:
         with install_lock(self.home):
             stuck = unfinished(self.home)
             if stuck:
-                raise Refused('An earlier installation did not finish. Restore it first with\n'
+                raise Refused('An earlier installation or rollback did not finish. Restore it first with\n'
                               f'  ./install.sh --rollback {stuck[-1][0]}')
             # Settle every file change first: a broken setting or an unsafe symlink stops the
             # installation before any package or agent CLI is installed.
@@ -283,6 +285,13 @@ class Run:
             notes.append('Sign in to each agent yourself: run `claude`, then `codex`, once each.')
         if not self.options.desktop and self.options.real:
             notes.append('--no-activate: packages, GNOME settings and services were left alone.')
+        if self.options.desktop:
+            session = self.desktop.session_environment()
+            for name in ('CODEX_HOME', 'CLAUDE_CONFIG_DIR'):
+                if os.environ.get(name) and session.get(name) != os.environ[name]:
+                    notes.append(f'{name} is set in this terminal but not for the whole desktop session, so the '
+                                 'workspace, its menus and the monitor would use the default folder. Set it in '
+                                 '~/.config/environment.d/ and log in again (see docs/install.md).')
         for note in notes:
             log('• ' + note)
         if folder:

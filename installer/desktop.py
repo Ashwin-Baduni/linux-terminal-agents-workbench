@@ -30,6 +30,7 @@ class Desktop:
         self.env = env
         self.run = run
         self.reloaded = False
+        self.masked = []        # units plan_units left alone because systemd reports them masked
 
     def command(self, *args, check=False):
         return self.run([str(a) for a in args], capture_output=True, text=True, env=self.env, check=check)
@@ -79,6 +80,11 @@ class Desktop:
         active = self.command('systemctl', '--user', 'is-active', unit).stdout.strip() or 'unknown'
         return {'enabled': enabled, 'active': active}
 
+    def session_environment(self):
+        """The variables the systemd user manager (and so the desktop session's services) has."""
+        output = self.command('systemctl', '--user', 'show-environment').stdout
+        return dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+
     def reload(self, force=False):
         """Make systemd read the unit files; force after a rollback has put old files back."""
         if force or not self.reloaded:
@@ -86,9 +92,12 @@ class Desktop:
             self.reloaded = True
 
     def plan_units(self, units, restart=()):
-        steps = []
+        steps, self.masked = [], []
         for unit in units:
             before = self.unit_state(unit)
+            if before['enabled'].startswith('masked'):
+                self.masked.append(unit)
+                continue
             after = {'enabled': 'enabled', 'active': 'active'}
             if before == after and unit not in restart:
                 continue

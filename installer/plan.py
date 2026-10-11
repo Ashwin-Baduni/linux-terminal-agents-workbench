@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,9 @@ from .fsops import State, Unsafe, relative, sha
 
 PRIVATE = ('claude-settings', 'codex-config')   # new agent settings files are private (0600)
 MEMORY_ROOT = 'ai-memory'
+UNIT_FOLDER = '.config/systemd/user/'
+# Where an administrator masks a user unit for everyone; a file in ~/.config/systemd/user would override it.
+SYSTEM_UNIT_DIRS = (Path('/etc/systemd/user'), Path('/run/systemd/user'))
 
 
 class PlanError(ValueError):
@@ -45,6 +49,7 @@ class Plan:
     changes: list = field(default_factory=list)
     kept: list = field(default_factory=list)       # (path, reason) left exactly as found
     notes: list = field(default_factory=list)
+    masked: set = field(default_factory=set)       # units left alone because they are masked
 
     def add(self, change):
         self.changes.append(change)
@@ -71,18 +76,68 @@ class Context:
         return target
 
 
+def link_target(target, link):
+    """The home path a manifest link means: its `link` read from the target's own folder."""
+    return relative('/', os.path.normpath(PurePosixPath(target).parent / link))
+
+
+def mask_of(context, target):
+    """Why the unit file at target must not be installed (a user or system mask), or None."""
+    name = PurePosixPath(target).name
+    state = context.home.state(target)
+    if state.kind == 'symlink' and os.path.realpath(context.home.root / target) == os.devnull:
+        return 'you masked it: its unit file links to /dev/null'
+    if context.real:
+        for folder in SYSTEM_UNIT_DIRS:
+            path = folder / name
+            if path.is_symlink() and os.path.realpath(path) == os.devnull:
+                return f'it is masked for every user in {folder}, and a unit file here would override that'
+    return None
+
+
+def masked_note(name, reason):
+    return (f'{name} is masked ({reason}), so the installer leaves it alone: no unit file, enabling or starting. '
+            f'Unmask it and run the installer again to add it.')
+
+
 def text(data):
     return None if data is None else data.decode('utf-8')
 
 
-def git_ignore_target(context):
+def configured_excludes(home, env):
+    """core.excludesfile read straight from the user's git config files, for when git is not installed yet.
+    Later files win, as in git: $XDG_CONFIG_HOME/git/config, then ~/.gitconfig."""
+    value, section = '', ''
+    for path in (Path(env.get('XDG_CONFIG_HOME') or home / '.config') / 'git/config', home / '.gitconfig'):
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.split('#', 1)[0].split(';', 1)[0].strip()
+            heading = re.match(r'^\[\s*([A-Za-z0-9.-]+)', line)
+            if heading:
+                section = heading[1].lower()
+            elif section == 'core':
+                found = re.match(r'(?i)^excludesfile\s*=\s*(.*)$', line)
+                if found:
+                    value = found[1].strip().strip('"')
+    return value
+
+
+def git_ignore_target(context, plan):
     """The global git ignore file git uses for the target user."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
     env['HOME'] = str(context.home.root)
     if not context.real:
         env.pop('XDG_CONFIG_HOME', None)
-    configured = subprocess.run(['git', 'config', '--global', '--get', 'core.excludesfile'],
-                                capture_output=True, text=True, env=env).stdout.strip()
+    if shutil.which('git', path=env.get('PATH')):
+        configured = subprocess.run(['git', 'config', '--global', '--get', 'core.excludesfile'],
+                                    capture_output=True, text=True, env=env).stdout.strip()
+    else:
+        configured = configured_excludes(context.home.root, env)
+        plan.notes.append('git is not installed yet, so its global ignore file was read from the git config files; '
+                          'the plan is made again with git once the packages are installed.')
     if configured:
         path = Path(configured.replace('~', str(context.home.root), 1) if configured.startswith('~') else configured)
     else:
@@ -122,7 +177,7 @@ def plan_codex_instructions(context, plan, entry, target, block):
     """AGENTS.md links to the memory when absent; existing instructions gain a reference block."""
     folder = PurePosixPath(target).parent
     memory = PurePosixPath(MEMORY_ROOT) / 'MEMORY.md'
-    link = os.path.relpath(str(memory), str(folder))
+    link = context.home.link_text(target, memory)
     agents = context.home.state(target)
     override = str(folder / 'AGENTS.override.md')
     if agents.kind == 'absent':
@@ -184,13 +239,22 @@ def build(manifest, context, components=None):
                 raise PlanError(f'{context.home.root / target} should be a folder.')
             continue
         if entry.kind == 'link':
-            if state.kind == 'symlink' and state.link == entry.link:
+            link = context.home.link_text(target, link_target(target, entry.link))
+            if state.kind == 'symlink' and state.link == link:
                 continue
             if state.kind == 'dir':
                 raise PlanError(f'{context.home.root / target} is a folder; a symlink is needed there.')
             why = 'create' if state.kind == 'absent' else 'replace ' + state.kind
-            plan.add(Change(target, 'symlink', state, link=entry.link, why=why))
+            plan.add(Change(target, 'symlink', state, link=link, why=why))
             continue
+        if target.startswith(UNIT_FOLDER):
+            reason = mask_of(context, target)
+            if reason:
+                name = PurePosixPath(target).name
+                plan.masked.add(name)
+                plan.kept.append((target, 'masked; left as it is'))
+                plan.notes.append(masked_note(name, reason))
+                continue
         data = manifest.render(entry, context.values)
         if entry.kind == 'seed':
             others = [p for p in entry.skip_if if context.home.state(p).kind != 'absent']
@@ -207,7 +271,7 @@ def build(manifest, context, components=None):
             plan_codex_instructions(context, plan, group[0], target, text(manifest.render(group[0], context.values)))
             continue
         if strategy == 'git-ignore':
-            target = git_ignore_target(context)
+            target = git_ignore_target(context, plan)
         state = context.home.state(target)
         if state.kind in ('dir', 'other'):
             raise PlanError(f'{context.home.root / target} is not a regular file; move it away first.')
