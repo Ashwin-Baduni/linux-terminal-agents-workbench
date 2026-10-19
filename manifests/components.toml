@@ -74,7 +74,7 @@ apt = ["git", "python3"]
 units = ["ai-memory-snapshot.timer"]
 
 [component.clipboard]
-summary = "Super+V clipboard list, kept in memory only"
+summary = "Super+V clipboard history with search and a full preview, kept in memory only"
 requires = []
 apt = ["libglib2.0-bin"]
 extension = "clipboard-list@linux-terminal-agents-workbench"

@@ -23,4 +23,6 @@ ai-memory status
 
 The monitor updates agent indicators. Blue means working, green means finished, red means input is needed or an error occurred, and grey means ready or stopped. The active pane has a light border.
 
-**Super+V** opens the clipboard list after the extension has loaded at login. It stores text in memory and forgets it at logout. **Super+M** still opens notifications.
+**Super+V** opens the clipboard list after the extension has loaded at login. Your copies are on the left, newest first, and the selected copy's full text is on the right. Type to search every copy. Click one, or press Enter, to copy it again. Esc, the ✕ or Super+V closes the list.
+
+Each copy shows whether it is text, a link or a path, how many lines it has, and how long ago you copied it: green under ten minutes, blue under an hour, coral after that. The list has no fixed length. It keeps everything since you logged in, until the copies reach about 32 MB of text, and then the oldest go first. The newest 200 are listed, and search finds the older ones. It keeps text only, holds it in memory, survives a screen lock and forgets everything at logout. **Super+M** still opens notifications.

@@ -18,6 +18,6 @@ The repository contains the actual configuration files. They remain readable so 
 | GNOME style | Dark Yaru blue, blue accent | `payload/gnome-look/gsettings.json` |
 | Dock | Bottom, 64 px icons, hides when appropriate | GNOME look settings |
 
-Matching themes are supplied for Claude Code, bat, glow, micro and Yazi. Starship and Atuin settings are under `payload/terminal/`. Fonts are installed through Ubuntu packages; font binaries are not copied from a personal home directory.
+The Super+V clipboard list uses the same colours with the same meanings. The selected copy is rose, the kind of copy is purple, and its age is green, blue or coral. Its preview uses JetBrains Mono. Matching themes are supplied for Claude Code, bat, glow, micro and Yazi. Starship and Atuin settings are under `payload/terminal/`. Fonts are installed through Ubuntu packages; font binaries are not copied from a personal home directory.
 
 The GNOME component contains a small list of desktop preferences. Monitor arrangement, scaling, HDR, GPU tuning, keyboard hardware, remote access, browser profiles and personal applications are outside this installer. System UI fonts remain those of the Ubuntu desktop.
