@@ -19,7 +19,7 @@ scripts/check-public.py --history
 git diff --check
 ```
 
-Run `tests/run.py relay` when relay behavior changes and before a release. `WORKBENCH_ONLINE=1 tests/run.py installer` also downloads the official CLI installation scripts to check their interfaces. It does not execute those remote scripts. The normal tests use isolated scratch homes and local stand-ins for system changes and agent processes.
+Run `tests/run.py relay` when relay behavior changes and before a release. `tests/clipboard/run.sh` tests the clipboard extension in a throwaway headless GNOME Shell. A test-only extension drives it with a virtual keyboard and pointer, and screenshots are saved. It needs `gnome-shell`, takes a few minutes per screen size and is not part of `tests/run.py`. `WORKBENCH_ONLINE=1 tests/run.py installer` also downloads the official CLI installation scripts to check their interfaces. It does not execute those remote scripts. The normal tests use isolated scratch homes and local stand-ins for system changes and agent processes.
 
 Update the manifests when adding an installed file or dependency. Preserve upstream licences and update `THIRD_PARTY_NOTICES.md` and `manifests/third-party.toml` when changing vendored material. Record real installation results separately from offline tests.
 

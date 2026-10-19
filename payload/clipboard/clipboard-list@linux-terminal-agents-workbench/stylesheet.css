@@ -1,31 +1,139 @@
-/* A plain list in GNOME's own dialog look: no icons, no toolbar, no settings. */
-/* Pure black with a faint edge, like the AMOLED terminal theme. */
+/*
+  Pure black with faint edges, like the AMOLED terminal theme, and the Workspace's colours:
+  each one keeps its meaning. Everything is bold so the colours read clearly.
+    selected copy  rose     #ff91c8  (the Workspace's "You")
+    kind           purple   #cba6f7
+    last 10 min    green    #a6e3a1
+    last hour      blue     #89b4fa
+    older          coral    #ffa891
+    close          red      #ff5555
+    details        grey     #9698a8, quieter text #6c7086
+*/
 .clipboard-list-dialog {
-  min-width: 600px;
   background-color: #000000;
   border: 1px solid #2f2f2f;
-}
-.clipboard-list-title {
+  border-radius: 16px;
+  padding: 0;
+  spacing: 0;
   font-weight: bold;
-  padding: 2px 10px 10px;
 }
+/* GNOME caps dialog content at 28em and spaces its parts; this list sets its own sizes. */
+.clipboard-list-dialog .modal-dialog-content-box {
+  max-width: 1600px;
+  padding: 0;
+  spacing: 0;
+}
+
+.clipboard-list-header {
+  padding: 12px 12px 12px 14px;
+  spacing: 12px;
+  border-bottom: 1px solid #2f2f2f;
+}
+.clipboard-list-search {
+  background-color: #0e0e0e;
+  border: 1px solid #2f2f2f;
+  border-radius: 10px;
+  padding: 6px 10px;
+  color: #e4e4e4;
+  font-weight: bold;
+}
+/* GNOME rings a focused search box in its accent colour (orange here), which would read as
+   "older"; this box is always focused, so it stays neutral instead. */
+.clipboard-list-search:hover,
+.clipboard-list-search:focus {
+  background-color: #0e0e0e;
+  border: 1px solid #4a4a4a;
+  color: #e4e4e4;
+  box-shadow: none !important;
+}
+.clipboard-list-search StLabel.hint-text {
+  color: #6c7086;
+}
+.clipboard-list-search-icon {
+  icon-size: 16px;
+  color: #6c7086;
+  padding-right: 4px;
+}
+.clipboard-list-close {
+  color: #ff5555;
+  font-size: 1.15em;
+  font-weight: bold;
+  padding: 4px 10px;
+  border-radius: 8px;
+}
+.clipboard-list-close:hover {
+  background-color: rgba(255, 85, 85, 0.15);
+}
+
 .clipboard-list-scroll {
-  max-height: 480px;
+  width: 360px;
+  height: 440px;
+  border-right: 1px solid #2f2f2f;
 }
 .clipboard-list-item {
-  padding: 8px 12px;
-  border-radius: 10px;
+  padding: 0 12px 0 0;
+  text-align: left;
 }
-.clipboard-list-item:hover,
-.clipboard-list-item:focus {
-  background-color: rgba(255, 255, 255, 0.1);
+.clipboard-list-item:selected {
+  background-color: #1c1c1c;
 }
-.clipboard-list-meta {
-  font-size: 0.85em;
-  color: rgba(255, 255, 255, 0.55);
+/* A real 3px strip: St lays out a coloured border but does not paint one side's colour. */
+.clipboard-list-bar {
+  width: 3px;
+}
+.clipboard-list-item:selected .clipboard-list-bar {
+  background-color: #ff91c8;
+}
+.clipboard-list-copy {
+  padding: 7px 0 7px 11px;
+}
+.clipboard-list-text {
+  color: #e4e4e4;
+  font-weight: bold;
+}
+.clipboard-list-item:selected .clipboard-list-text {
+  color: #ff91c8;
+}
+.clipboard-list-details {
   padding-top: 2px;
+  font-size: 0.85em;
 }
+.clipboard-list-kind { color: #cba6f7; font-weight: bold; }
+.clipboard-list-size { color: #9698a8; font-weight: bold; }
+.clipboard-list-dot { color: #6c7086; font-weight: bold; }
+.clipboard-list-age { font-weight: bold; }
+.clipboard-list-age.fresh { color: #a6e3a1; }
+.clipboard-list-age.recent { color: #89b4fa; }
+.clipboard-list-age.older { color: #ffa891; }
 .clipboard-list-empty {
-  padding: 12px;
-  color: rgba(255, 255, 255, 0.6);
+  padding: 14px;
+  color: #6c7086;
+}
+
+.clipboard-list-preview {
+  width: 560px;
+  height: 440px;
+}
+.clipboard-list-preview-text {
+  padding: 12px 16px;
+  color: #e4e4e4;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.9em;
+  font-weight: bold;
+}
+
+.clipboard-list-footer {
+  padding: 9px 14px;
+  spacing: 18px;
+  border-top: 1px solid #2f2f2f;
+}
+.clipboard-list-hint {
+  color: #6c7086;
+  font-size: 0.9em;
+  font-weight: bold;
+}
+.clipboard-list-name {
+  color: #e4e4e4;
+  font-size: 0.9em;
+  font-weight: bold;
 }

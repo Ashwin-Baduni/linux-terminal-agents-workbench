@@ -37,7 +37,7 @@ When it finishes, open a new terminal window. Log out and back in once so GNOME 
 | workspace | The mouse-driven tmux workspace, the Directory sidebar, the menu-enabled agent tabs, Open Workspace Here in Files, the dock launcher and the two services that watch agents and save layouts |
 | agents | Agent pairs (the relay), Claude Code and Codex when they are missing, and their theme, voice, copy and hook settings |
 | memory | An empty shared memory in `~/ai-memory`, the `ai-memory` helper and its snapshot timer, and the links both agents read |
-| clipboard | The Super+V clipboard list. It keeps text only and forgets it at logout. |
+| clipboard | The Super+V clipboard history: search, a full preview of the selected copy, and how long ago each one was copied. It keeps text only and forgets it at logout. |
 | gnome-look | Dark Yaru blue style and a bottom dock that hides itself |
 
 `manifests/files.toml` lists every file and where it goes. `manifests/components.toml` lists the packages, services and GNOME settings.

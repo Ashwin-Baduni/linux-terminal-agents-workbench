@@ -7,7 +7,7 @@ The workbench now has a sanitized source tree, a working installer and rollback,
 - Ghostty with JetBrains Mono at 10 pt, a pure black background and the matching shell/tool themes.
 - The tmux workspace, Directory sidebar, mouse menus, layout recovery and agent relay.
 - An empty shared-memory system for Claude Code and Codex, stable project markers and local snapshots. Folder renames retain the project memory name.
-- The clipboard extension and the selected GNOME theme and dock settings.
+- The Super+V clipboard history (version 2: search, a full preview and colour-coded ages) and the selected GNOME theme and dock settings.
 - Component manifests, upstream licences, configuration merges, backups, conflict-aware rollback and publication checks.
 
 Personal notes, credentials, conversations, histories, machine tuning and account state are excluded. Existing memory is preserved. Agent permission and model choices stay as they are unless `--agent-policy full-access` is explicitly selected. Public installation reconstructs the machinery; restore your own memory from a separate private backup.
